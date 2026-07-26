@@ -73,9 +73,9 @@ internal sealed class MainWindow : Window
     TextBlock _propHint;
     Slider _volume;
     TextBlock _volumeVal;
-    Slider  _alpha, _film;
-    TextBlock _alphaVal, _filmVal, _statusText, _cmdPreview;
-    Border  _alphaRow, _filmRow, _embedNote;
+    Slider  _alpha, _film, _wallAlpha;
+    TextBlock _alphaVal, _filmVal, _wallAlphaVal, _statusText, _cmdPreview;
+    Border  _alphaRow, _filmRow, _wallAlphaRow, _embedNote;
     CheckBox _full, _keepWe, _noFallback;
     ComboBox _target;
     Button  _startBtn, _stopBtn, _restoreBtn;
@@ -851,7 +851,9 @@ internal sealed class MainWindow : Window
             : "这张壁纸没有可直接调节的参数。";
     }
 
-    // WE stores UI labels as localisation keys like "ui_browse_properties_scheme_color".
+    // WE labels come in two flavours: localisation keys like
+    // "ui_browse_properties_scheme_color", and author-written text that may carry
+    // simple HTML markup ("<big><b>音频感应大小").  Both need cleaning up.
     static string PrettyLabel(string text, string key)
     {
         if (text.StartsWith("ui_", StringComparison.OrdinalIgnoreCase))
@@ -862,7 +864,22 @@ internal sealed class MainWindow : Window
             s = s.Replace('_', ' ').Trim();
             if (s.Length > 0) return char.ToUpperInvariant(s[0]) + s.Substring(1);
         }
-        return text.Length > 0 ? text : key;
+        string t = StripMarkup(text).Trim();
+        return t.Length > 0 ? t : key;
+    }
+
+    static string StripMarkup(string s)
+    {
+        if (string.IsNullOrEmpty(s) || s.IndexOf('<') < 0) return s ?? "";
+        var sb = new StringBuilder(s.Length);
+        int depth = 0;
+        foreach (char c in s)
+        {
+            if (c == '<') { depth++; continue; }
+            if (c == '>') { if (depth > 0) depth--; continue; }
+            if (depth == 0) sb.Append(c);
+        }
+        return sb.ToString();
     }
 
     UIElement BuildPropControl(string name, string type, string label, JVal p)
@@ -1076,6 +1093,8 @@ internal sealed class MainWindow : Window
         bool showFilm = _mode == "overlay";
         _alphaRow.Visibility = showAlpha ? Visibility.Visible : Visibility.Collapsed;
         _filmRow.Visibility = showFilm ? Visibility.Visible : Visibility.Collapsed;
+        // the wallpaper is layered in every non-overlay mode, so it can always be dimmed
+        _wallAlphaRow.Visibility = showFilm ? Visibility.Collapsed : Visibility.Visible;
         _embedNote.Visibility = _mode == "embed" ? Visibility.Visible : Visibility.Collapsed;
     }
 
@@ -1085,19 +1104,53 @@ internal sealed class MainWindow : Window
     {
         var card = Card();
         var sp = (StackPanel)card.Child;
-        sp.Children.Add(SectionHeader("不透明度", "在背景可见度与文字清晰度之间权衡"));
+        sp.Children.Add(SectionHeader("不透明度", "运行中拖动即时生效，不用重启"));
 
-        _alpha = MakeSlider(0, 255, 205);
-        _alphaVal = ValueBadge("205");
-        _alphaRow = SliderRow("宿主不透明度", "越低 = 动画越明显，文字越淡", _alpha, _alphaVal);
-        _alpha.ValueChanged += (s, e) => { _alphaVal.Text = ((int)_alpha.Value).ToString(); UpdateCommandPreview(); };
+        _alpha = MakeSlider(0, 255, 235);
+        _alphaVal = ValueBadge("235");
+        _alphaRow = SliderRow("宿主不透明度", "越高 = 文字越清晰；壁纸太亮就调高这个", _alpha, _alphaVal);
+        _alpha.ValueChanged += (s, e) =>
+        {
+            _alphaVal.Text = ((int)_alpha.Value).ToString();
+            UpdateCommandPreview();
+            SendLiveAlpha(WM_SET_HOST_ALPHA, (int)_alpha.Value);
+        };
         sp.Children.Add(_alphaRow);
+
+        _wallAlpha = MakeSlider(0, 255, 255);
+        _wallAlphaVal = ValueBadge("255");
+        _wallAlphaRow = SliderRow("壁纸亮度", "越低 = 壁纸越暗；比淡化界面更能保住文字对比度", _wallAlpha, _wallAlphaVal);
+        _wallAlpha.ValueChanged += (s, e) =>
+        {
+            _wallAlphaVal.Text = ((int)_wallAlpha.Value).ToString();
+            UpdateCommandPreview();
+            SendLiveAlpha(WM_SET_WALL_ALPHA, (int)_wallAlpha.Value);
+        };
+        sp.Children.Add(_wallAlphaRow);
 
         _film = MakeSlider(0, 255, 70);
         _filmVal = ValueBadge("70");
         _filmRow = SliderRow("壁纸膜不透明度", "盖在界面上的壁纸的不透明度", _film, _filmVal);
-        _film.ValueChanged += (s, e) => { _filmVal.Text = ((int)_film.Value).ToString(); UpdateCommandPreview(); };
+        _film.ValueChanged += (s, e) =>
+        {
+            _filmVal.Text = ((int)_film.Value).ToString();
+            UpdateCommandPreview();
+            SendLiveAlpha(WM_SET_WALL_ALPHA, (int)_film.Value);
+        };
         sp.Children.Add(_filmRow);
+
+        var tip = new Border
+        {
+            Margin = new Thickness(0, 10, 0, 0), Padding = new Thickness(12, 9, 12, 9),
+            CornerRadius = new CornerRadius(8), Background = B("#1A1E27"),
+            BorderBrush = Stroke, BorderThickness = new Thickness(1)
+        };
+        tip.Child = new TextBlock
+        {
+            Text = "界面被壁纸冲得发白？先把「壁纸亮度」往下拉（比如 120），再把「宿主不透明度」拉到 240 以上。",
+            Foreground = Muted, FontSize = 11, TextWrapping = TextWrapping.Wrap
+        };
+        sp.Children.Add(tip);
 
         _embedNote = new Border
         {
@@ -1447,18 +1500,45 @@ internal sealed class MainWindow : Window
         catch (Exception ex) { Dispatch(() => AppendLog("[!] 停止出错：" + ex.Message, RedC)); }
     }
 
+    // Live opacity: post straight to the running helper's message-only window so the
+    // change lands immediately.  Restarting to try a different value is useless when
+    // you are eyeballing contrast against a moving wallpaper.
+    const uint WM_SET_HOST_ALPHA = 0x8000 + 1;
+    const uint WM_SET_WALL_ALPHA = 0x8000 + 2;
+
+    void SendLiveAlpha(uint msg, int value)
+    {
+        if (!_running || _proc == null) return;
+        try
+        {
+            IntPtr h = FindHelperMsgWindow(_proc.Id);
+            if (h != IntPtr.Zero) Native.PostMessage(h, msg, new IntPtr(value), IntPtr.Zero);
+        }
+        catch { }
+    }
+
+    // The C++ helper registers "WeCodexBgMsg", the C# one "WeCodexBgMsgCs".  build.bat
+    // picks whichever toolchain exists, so both have to be searched - looking for only
+    // one silently degrades graceful stop into kill-and-repair and breaks live opacity.
+    static readonly string[] HelperMsgClasses = { "WeCodexBgMsg", "WeCodexBgMsgCs" };
+
     static IntPtr FindHelperMsgWindow(int pid)
     {
-        IntPtr after = IntPtr.Zero;
         var HWND_MESSAGE = new IntPtr(-3);
-        while (true)
+        foreach (string cls in HelperMsgClasses)
         {
-            IntPtr h = Native.FindWindowEx(HWND_MESSAGE, after, "WeCodexBgMsgCs", null);
-            if (h == IntPtr.Zero) return IntPtr.Zero;
-            uint wpid; Native.GetWindowThreadProcessId(h, out wpid);
-            if (wpid == (uint)pid) return h;
-            after = h;
+            IntPtr after = IntPtr.Zero;
+            while (true)
+            {
+                IntPtr h = Native.FindWindowEx(HWND_MESSAGE, after, cls, null);
+                if (h == IntPtr.Zero) break;
+                uint wpid;
+                Native.GetWindowThreadProcessId(h, out wpid);
+                if (wpid == (uint)pid) return h;
+                after = h;
+            }
         }
+        return IntPtr.Zero;
     }
 
     void OnProcExited()
@@ -1513,6 +1593,7 @@ internal sealed class MainWindow : Window
         a.Add("--mode"); a.Add(_mode);
         if (_mode == "composite" || _mode == "alpha") { a.Add("--alpha"); a.Add(((int)_alpha.Value).ToString()); }
         if (_mode == "overlay") { a.Add("--film"); a.Add(((int)_film.Value).ToString()); }
+        else if ((int)_wallAlpha.Value != 255) { a.Add("--wall-alpha"); a.Add(((int)_wallAlpha.Value).ToString()); }
 
         string we = _we.Text.Trim();
         if (we.Length > 0) { a.Add("--we"); a.Add(we); }
@@ -1566,9 +1647,11 @@ internal sealed class MainWindow : Window
         _stopBtn.IsEnabled = running;
         _stopBtn.Opacity = running ? 1 : 0.45;
         _restoreBtn.IsEnabled = !running;
-        // lock the editable panel while running
+        // Lock the settings that only take effect at launch.  The opacity sliders stay
+        // live on purpose: they are pushed to the running helper and are exactly what
+        // you need to tune while watching the result.
         foreach (var c in new Control[] { _wallpaper, _we, _weWindow, _contentClass, _round, _fps,
-                                          _alpha, _film, _target, _full, _keepWe, _noFallback })
+                                          _target, _full, _keepWe, _noFallback })
             if (c != null) c.IsEnabled = !running;
         foreach (var card in _modeCards) card.IsHitTestVisible = !running;
 
@@ -1619,10 +1702,11 @@ internal sealed class MainWindow : Window
             sb.AppendLine("contentClass=" + _contentClass.Text);
             sb.AppendLine("round=" + _round.Text);
             sb.AppendLine("fps=" + _fps.Text);
-            sb.AppendLine("cfgver=2");
+            sb.AppendLine("cfgver=3");
             sb.AppendLine("mode=" + _mode);
             sb.AppendLine("alpha=" + (int)_alpha.Value);
             sb.AppendLine("film=" + (int)_film.Value);
+            sb.AppendLine("wallAlpha=" + (int)_wallAlpha.Value);
             sb.AppendLine("full=" + (_full.IsChecked == true));
             sb.AppendLine("keepWe=" + (_keepWe.IsChecked == true));
             sb.AppendLine("noFallback=" + (_noFallback.IsChecked == true));
@@ -1656,10 +1740,14 @@ internal sealed class MainWindow : Window
             // leaves Electron hosts (Codex/ChatGPT) rendering but unclickable.  Anyone
             // carrying that saved setting gets moved to the safe default exactly once.
             string ver;
-            if ((!map.TryGetValue("cfgver", out ver) || ParseInt(ver, 1) < 2) && _mode == "composite")
-                _mode = "alpha";
-            if (map.TryGetValue("alpha", out v)) _alpha.Value = ParseInt(v, 205);
+            int cfgver = map.TryGetValue("cfgver", out ver) ? ParseInt(ver, 1) : 1;
+            if (cfgver < 2 && _mode == "composite") _mode = "alpha";
+            // cfgver 3: the old 205 host opacity washes the UI out under a bright
+            // wallpaper.  Nudge anyone still on it up to the readable default.
+            if (cfgver < 3 && (int)_alpha.Value <= 205) _alpha.Value = 235;
+            if (map.TryGetValue("alpha", out v)) _alpha.Value = ParseInt(v, 235);
             if (map.TryGetValue("film", out v)) _film.Value = ParseInt(v, 70);
+            if (map.TryGetValue("wallAlpha", out v)) _wallAlpha.Value = ParseInt(v, 255);
             if (map.TryGetValue("full", out v)) _full.IsChecked = v == "True";
             if (map.TryGetValue("keepWe", out v)) _keepWe.IsChecked = v == "True";
             if (map.TryGetValue("noFallback", out v)) _noFallback.IsChecked = v == "True";

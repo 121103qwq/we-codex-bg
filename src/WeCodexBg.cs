@@ -157,7 +157,7 @@ internal static class WeCodexBg
         // alpha default: it only layers the TOP-LEVEL window, which every host
         // tolerates.  composite touches the content child and is unsafe on Chromium.
         public Mode Mode = Mode.Alpha;
-        public byte Alpha = 205, Film = 70;
+        public byte Alpha = 235, Film = 70, WallAlpha = 255;
         public bool ClientOnly = true, KeepWe = false, Fallback = true;
         public int Fps = 30, Round = 0;
         public bool ListOnly, TreeOnly, RestoreOnly;
@@ -174,6 +174,9 @@ internal static class WeCodexBg
     static Mode _mode = Mode.Composite;
     static Place _place = Place.ChildBottom;
     static bool _clientOnly = true, _keepWe, _verbose;
+    // live-adjustable opacity, driven by WM_APP+1 / WM_APP+2 from the UI
+    const uint WM_SET_HOST_ALPHA = 0x8000 + 1, WM_SET_WALL_ALPHA = 0x8000 + 2;
+    static byte _liveHostAlpha = 255, _liveWallAlpha = 255;
     static int _round;
     static uint _mainThread;
 
@@ -546,6 +549,13 @@ internal static class WeCodexBg
         else SetWindowPos(_wall, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 
         MakeClickThroughTree(_wall);          // the wallpaper must never eat a click
+
+        // Layer the wallpaper in every mode (not just overlay) so its brightness can be
+        // dialled down live.  Dimming the wallpaper preserves host contrast far better
+        // than fading the host does, which matters with a bright wallpaper.
+        SetStyle(_wall, GWL_EXSTYLE, Style(_wall, GWL_EXSTYLE) | WS_EX_LAYERED);
+        SetLayeredWindowAttributes(_wall, 0, _liveWallAlpha, LWA_ALPHA);
+
         SetWindowPos(_wall, IntPtr.Zero, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         ShowWindow(_wall, SW_SHOWNOACTIVATE);
@@ -762,8 +772,10 @@ Modes
   --mode alpha       wallpaper pinned below the window + whole window translucent
   --mode overlay     wallpaper pinned above the window as a click-through film;
                      the Codex window itself is never modified
-  --alpha 0-255      host opacity for composite / alpha (default 205)
+  --alpha 0-255      host opacity for composite / alpha (default 235)
   --film 0-255       wallpaper opacity for overlay (default 70)
+  --wall-alpha 0-255 wallpaper brightness in composite/alpha/embed (default 255);
+                     lower it to stop a bright wallpaper washing the host out
   --content-class <s>  which child window class to fade in composite mode
   --no-fallback      do not auto-fall back to the next mode when one fails
 
@@ -846,6 +858,7 @@ Geometry / misc
                     break;
                 case "--alpha": o.Alpha = (byte)(ParseUInt(a[++i], 205) & 0xFF); break;
                 case "--film": o.Film = (byte)(ParseUInt(a[++i], 70) & 0xFF); break;
+                case "--wall-alpha": o.WallAlpha = (byte)(ParseUInt(a[++i], 255) & 0xFF); break;
                 case "--fps": o.Fps = ParseInt(a[++i], 30); break;
                 case "--round": o.Round = ParseInt(a[++i], 0); break;
                 case "--full": o.ClientOnly = false; break;
@@ -915,6 +928,8 @@ Geometry / misc
         _keepWe = o.KeepWe;
         _clientOnly = o.ClientOnly;
         _round = o.Round;
+        _liveHostAlpha = o.Alpha;
+        _liveWallAlpha = o.Mode == Mode.Overlay ? o.Film : o.WallAlpha;
 
         if (o.ListOnly) { PrintList(); return 0; }
         if (o.RestoreOnly) { RestoreOnly(o); return 0; }
@@ -982,6 +997,19 @@ Geometry / misc
                         }
                         return IntPtr.Zero;
                     }
+                    return IntPtr.Zero;
+                case WM_SET_HOST_ALPHA:             // live host opacity
+                {
+                    _liveHostAlpha = (byte)(w.ToInt64() & 0xFF);
+                    IntPtr layered = _content != IntPtr.Zero && IsWindow(_content) ? _content
+                                   : (_targetExSaved && _target != IntPtr.Zero && IsWindow(_target) ? _target : IntPtr.Zero);
+                    if (layered != IntPtr.Zero) SetLayeredWindowAttributes(layered, 0, _liveHostAlpha, LWA_ALPHA);
+                    return IntPtr.Zero;
+                }
+                case WM_SET_WALL_ALPHA:             // live wallpaper brightness
+                    _liveWallAlpha = (byte)(w.ToInt64() & 0xFF);
+                    if (_wall != IntPtr.Zero && IsWindow(_wall))
+                        SetLayeredWindowAttributes(_wall, 0, _liveWallAlpha, LWA_ALPHA);
                     return IntPtr.Zero;
                 case 0x0312:                        // WM_HOTKEY: emergency restore
                     Log("[i] 收到紧急还原热键 (Ctrl+Alt+Shift+W)。");

@@ -159,8 +159,9 @@ struct Options {
     // alpha is the default: it only layers the TOP-LEVEL window, which every host
     // tolerates.  composite touches the content child and is unsafe on Chromium.
     Mode  mode       = Mode::Alpha;
-    BYTE  alpha      = 205;                    // composite/alpha: host opacity
+    BYTE  alpha      = 235;                    // composite/alpha: host opacity
     BYTE  filmAlpha  = 70;                     // overlay: wallpaper opacity
+    BYTE  wallAlpha  = 255;                    // wallpaper brightness in other modes
     bool  clientOnly = true;
     int   fps        = 30;
     int   round      = 0;
@@ -194,6 +195,8 @@ struct State {
     int   round = 0;
 };
 static State g;
+static BYTE  g_liveHostAlpha = 255;   // live-adjustable opacity (see WM_SET_*_ALPHA)
+static BYTE  g_liveWallAlpha = 255;
 static DWORD g_mainThread = 0;
 static volatile bool g_stopping = false;   // set by RestoreAll: Sync must stop touching windows
 
@@ -585,6 +588,14 @@ static void PrepareWallWindow() {
     else SetWindowPos(g.wall, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 
     MakeClickThroughTree(g.wall);          // the wallpaper must never eat a click
+
+    // Layer the wallpaper in every mode (not just overlay) so its brightness can be
+    // dialled down live.  Dimming the wallpaper preserves host contrast far better
+    // than fading the host does, which matters a lot with a bright wallpaper.
+    SetWindowLongPtrW(g.wall, GWL_EXSTYLE,
+                      GetWindowLongPtrW(g.wall, GWL_EXSTYLE) | WS_EX_LAYERED);
+    SetLayeredWindowAttributes(g.wall, 0, g_liveWallAlpha, LWA_ALPHA);
+
     SetWindowPos(g.wall, nullptr, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     ShowWindow(g.wall, SW_SHOWNOACTIVATE);
@@ -780,6 +791,28 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
 #define TIMER_GUARD  2
 #define HOTKEY_PANIC 1
 
+// Live opacity, posted by the UI to this process's message-only window.
+// wParam = 0..255.  Being able to retune while running is the whole point: a bright
+// wallpaper washes the host out, and restarting to try another value is useless.
+#define WM_SET_HOST_ALPHA (WM_APP + 1)
+#define WM_SET_WALL_ALPHA (WM_APP + 2)
+
+// Whichever window this mode made translucent is the one to retune.
+static HWND LayeredHostWindow() {
+    if (g.content && IsWindow(g.content)) return g.content;   // composite
+    if (g.targetExSaved && g.target && IsWindow(g.target)) return g.target;  // alpha
+    return nullptr;
+}
+static void ApplyLiveHostAlpha() {
+    HWND h = LayeredHostWindow();
+    if (!h) return;
+    SetLayeredWindowAttributes(h, 0, g_liveHostAlpha, LWA_ALPHA);
+}
+static void ApplyLiveWallAlpha() {
+    if (!g.wall || !IsWindow(g.wall)) return;
+    SetLayeredWindowAttributes(g.wall, 0, g_liveWallAlpha, LWA_ALPHA);
+}
+
 static LRESULT CALLBACK MsgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_TIMER:
@@ -796,6 +829,14 @@ static LRESULT CALLBACK MsgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             }
             return 0;
         }
+        return 0;
+    case WM_SET_HOST_ALPHA:
+        g_liveHostAlpha = (BYTE)w;
+        ApplyLiveHostAlpha();
+        return 0;
+    case WM_SET_WALL_ALPHA:
+        g_liveWallAlpha = (BYTE)w;
+        ApplyLiveWallAlpha();
         return 0;
     case WM_HOTKEY:
         if (w == HOTKEY_PANIC) {
@@ -851,8 +892,10 @@ L"  --mode embed       embed only, no transparency (plumbing test)\n"
 L"  --mode alpha       wallpaper pinned below the window + whole window translucent\n"
 L"  --mode overlay     wallpaper pinned above the window as a click-through film;\n"
 L"                     the Codex window itself is never modified\n"
-L"  --alpha 0-255      host opacity for composite / alpha (default 205)\n"
+L"  --alpha 0-255      host opacity for composite / alpha (default 235)\n"
 L"  --film 0-255       wallpaper opacity for overlay (default 70)\n"
+L"  --wall-alpha 0-255 wallpaper brightness in composite/alpha/embed (default 255);\n"
+L"                     lower it to stop a bright wallpaper washing the host out\n"
 L"  --content-class <s>  which child window class to fade in composite mode\n"
 L"  --no-fallback      do not auto-fall back to the next mode when one fails\n"
 L"\n"
@@ -912,6 +955,7 @@ static bool ParseArgs(int argc, wchar_t** argv, Options& o) {
         }
         else if (a == L"--alpha") { if (!want(L"--alpha")) return false; o.alpha = (BYTE)wcstoul(argv[++i], nullptr, 10); }
         else if (a == L"--film")  { if (!want(L"--film")) return false; o.filmAlpha = (BYTE)wcstoul(argv[++i], nullptr, 10); }
+        else if (a == L"--wall-alpha") { if (!want(L"--wall-alpha")) return false; o.wallAlpha = (BYTE)wcstoul(argv[++i], nullptr, 10); }
         else if (a == L"--fps")   { if (!want(L"--fps")) return false; o.fps = (int)wcstol(argv[++i], nullptr, 10); }
         else if (a == L"--round") { if (!want(L"--round")) return false; o.round = (int)wcstol(argv[++i], nullptr, 10); }
         else if (a == L"--full")     o.clientOnly = false;
@@ -991,6 +1035,8 @@ int main() {
     g.keepWe = o.keepWe;
     g.clientOnly = o.clientOnly;
     g.round = o.round;
+    g_liveHostAlpha = o.alpha;
+    g_liveWallAlpha = (o.mode == Mode::Overlay) ? o.filmAlpha : o.wallAlpha;
 
     if (o.listOnly)    { PrintList(); return 0; }
     if (o.restoreOnly) { RestoreOnly(o); return 0; }

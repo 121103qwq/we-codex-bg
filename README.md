@@ -67,6 +67,8 @@ bin\we-codex-bg-ui.exe
 | **壁纸路径**（也可拖拽文件进输入框 / 「浏览」） | `--wallpaper` |
 | **控制模块**：播放/暂停/停止/静音/音量 | `wallpaper64.exe -control ...` |
 | **壁纸参数**：读 `project.json` 的 `general.properties` 动态生成控件 | `-control applyProperties` |
+| **宿主不透明度**（运行中实时生效） | `--alpha 0-255`（默认 235） |
+| **壁纸亮度**（运行中实时生效） | `--wall-alpha 0-255`（默认 255） |
 | **模式** 四张卡片：合成 / 透明 / 覆盖 / 嵌入 | `--mode composite\|alpha\|overlay\|embed` |
 | **宿主不透明度** 滑块（合成 / 透明模式下显示） | `--alpha 0-255` |
 | **壁纸膜不透明度** 滑块（覆盖模式下显示） | `--film 0-255` |
@@ -102,6 +104,22 @@ bin\we-codex-bg-ui.exe
 同一套 Steam 查找逻辑也补进了 `we-codex-bg.exe` 的 `FindWeExe()`：
 以前它只在 WE **正在运行**时能靠进程路径找到 `wallpaper64.exe`，
 WE 没开时那串写死的目录基本必然落空；现在走注册表 + `libraryfolders.vdf`。
+
+### 界面被壁纸冲得发白怎么办
+
+**两条滑块都可以在运行中实时拖动**，不用停下来重开 —— 对着实际效果调才有意义。
+
+| 滑块 | 作用 | 建议 |
+|---|---|---|
+| **壁纸亮度** `--wall-alpha` | 直接压暗壁纸本身 | **优先调这个**。亮壁纸拉到 100~150，文字对比度立刻回来 |
+| **宿主不透明度** `--alpha` | Codex 窗口整体的不透明度 | 拉到 240 以上保证文字清晰 |
+
+原理上「压暗壁纸」比「淡化界面」更划算：淡化界面会同时把文字一起淡掉，而压暗壁纸只动背景。
+所以默认宿主不透明度从早期的 205 提到了 **235**（旧配置会自动迁移）。
+
+实现上，UI 直接向 helper 的 message-only 窗口 `PostMessage`（`WM_APP+1` / `WM_APP+2`，
+`wParam` 就是 0-255 的 alpha），helper 收到后重新 `SetLayeredWindowAttributes`。
+为此壁纸窗口在所有模式下都会被设成 layered（以前只有 overlay 模式才是）。
 
 ### 控制模块
 
@@ -247,8 +265,9 @@ bin\we-codex-bg.exe -v
 
 ```
 --mode composite|embed|alpha|overlay
---alpha 0-255        composite/alpha 的宿主不透明度（默认 205）
+--alpha 0-255        composite/alpha 的宿主不透明度（默认 235）
 --film 0-255         overlay 的壁纸不透明度（默认 70）
+--wall-alpha 0-255   其他模式下的壁纸亮度（默认 255，调低可压暗壁纸）
 --content-class <s>  composite 模式指定要淡化的子窗口类名片段
 --title / --class / --exe / --pid    指定目标窗口
 --we <wallpaper64.exe 路径>
