@@ -702,8 +702,8 @@ internal sealed class MainWindow : Window
 
     // control module -----------------------------------------------------------
     //
-    // Everything here drives the running wallpaper through Wallpaper Engine's own
-    // CLI (`wallpaper64.exe -control ...`).  We never poke the renderer ourselves.
+    // Transport uses Wallpaper Engine's documented CLI.  Its CLI has mute/unmute,
+    // but no volume command, so the volume slider targets WE's own mixer sessions.
 
     UIElement BuildControlSection()
     {
@@ -724,9 +724,8 @@ internal sealed class MainWindow : Window
         _volume = MakeSlider(0, 100, 100);
         _volumeVal = ValueBadge("100");
         _volume.ValueChanged += (s, e) => _volumeVal.Text = ((int)_volume.Value).ToString();
-        // only push on release: WE spawns a process per call, so don't fire per pixel
-        _volume.PreviewMouseUp += (s, e) => WeControl("volume", "-value", ((int)_volume.Value).ToString());
-        sp.Children.Add(SliderRow("音量", "拖动结束后应用", _volume, _volumeVal));
+        _volume.PreviewMouseUp += (s, e) => ApplyWallpaperVolume();
+        sp.Children.Add(SliderRow("壁纸音量", "拖动结束后应用（仅 Wallpaper Engine）", _volume, _volumeVal));
 
         // -- dynamic wallpaper properties --
         _propHint = new TextBlock
@@ -774,6 +773,20 @@ internal sealed class MainWindow : Window
             AppendLog("[we] -control " + cmd + (extra.Length > 0 ? " " + string.Join(" ", extra) : ""), Faint);
         }
         catch (Exception ex) { AppendLog("[!] 控制命令失败：" + ex.Message, RedC); }
+    }
+
+    void ApplyWallpaperVolume()
+    {
+        int value = (int)_volume.Value;
+        try
+        {
+            int count = WallpaperAudio.SetVolume(value / 100f);
+            if (count > 0)
+                AppendLog("[audio] Wallpaper Engine 音量 = " + value + "（" + count + " 个会话）", Faint);
+            else
+                AppendLog("[!] 未找到正在输出声音的 Wallpaper Engine 会话。", YellowC);
+        }
+        catch (Exception ex) { AppendLog("[!] 设置壁纸音量失败：" + ex.Message, RedC); }
     }
 
     string ResolveWeExe()
@@ -1977,5 +1990,158 @@ internal static class Native
             return (slash >= 0 ? full.Substring(slash + 1) : full).ToLowerInvariant();
         }
         finally { CloseHandle(p); }
+    }
+}
+
+// Windows volume mixer access.  Only audio sessions belonging to Wallpaper Engine
+// renderer processes are changed; the host application is never considered.
+internal static class WallpaperAudio
+{
+    const uint CLSCTX_ALL = 23;
+
+    enum EDataFlow { Render = 0 }
+    enum ERole { Multimedia = 1 }
+
+    [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
+    class MMDeviceEnumeratorComObject { }
+
+    [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDeviceEnumerator
+    {
+        [PreserveSig] int EnumAudioEndpoints(int flow, uint stateMask, out IntPtr devices);
+        [PreserveSig] int GetDefaultAudioEndpoint(EDataFlow flow, ERole role, out IMMDevice device);
+    }
+
+    [ComImport, Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDevice
+    {
+        [PreserveSig] int Activate(ref Guid iid, uint clsCtx, IntPtr activationParams,
+                                   [MarshalAs(UnmanagedType.IUnknown)] out object value);
+    }
+
+    [ComImport, Guid("77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IAudioSessionManager2
+    {
+        [PreserveSig] int GetAudioSessionControl(ref Guid sessionGuid, uint flags, out IntPtr control);
+        [PreserveSig] int GetSimpleAudioVolume(ref Guid sessionGuid, uint flags, out IntPtr volume);
+        [PreserveSig] int GetSessionEnumerator(out IAudioSessionEnumerator sessions);
+    }
+
+    [ComImport, Guid("E2F5BB11-0570-40CA-ACDD-3AA01277DEE8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IAudioSessionEnumerator
+    {
+        [PreserveSig] int GetCount(out int count);
+        [PreserveSig] int GetSession(int index, out IAudioSessionControl control);
+    }
+
+    [ComImport, Guid("F4B1A599-7266-4319-A8CA-E70ACB11E8CD"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IAudioSessionControl
+    {
+        [PreserveSig] int GetState(out int state);
+        [PreserveSig] int GetDisplayName([MarshalAs(UnmanagedType.LPWStr)] out string value);
+        [PreserveSig] int SetDisplayName([MarshalAs(UnmanagedType.LPWStr)] string value, ref Guid context);
+        [PreserveSig] int GetIconPath([MarshalAs(UnmanagedType.LPWStr)] out string value);
+        [PreserveSig] int SetIconPath([MarshalAs(UnmanagedType.LPWStr)] string value, ref Guid context);
+        [PreserveSig] int GetGroupingParam(out Guid value);
+        [PreserveSig] int SetGroupingParam(ref Guid value, ref Guid context);
+        [PreserveSig] int RegisterAudioSessionNotification(IntPtr client);
+        [PreserveSig] int UnregisterAudioSessionNotification(IntPtr client);
+    }
+
+    [ComImport, Guid("BFB7FF88-7239-4FC9-8FA2-07C950BE9C6D"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IAudioSessionControl2
+    {
+        [PreserveSig] int GetState(out int state);
+        [PreserveSig] int GetDisplayName([MarshalAs(UnmanagedType.LPWStr)] out string value);
+        [PreserveSig] int SetDisplayName([MarshalAs(UnmanagedType.LPWStr)] string value, ref Guid context);
+        [PreserveSig] int GetIconPath([MarshalAs(UnmanagedType.LPWStr)] out string value);
+        [PreserveSig] int SetIconPath([MarshalAs(UnmanagedType.LPWStr)] string value, ref Guid context);
+        [PreserveSig] int GetGroupingParam(out Guid value);
+        [PreserveSig] int SetGroupingParam(ref Guid value, ref Guid context);
+        [PreserveSig] int RegisterAudioSessionNotification(IntPtr client);
+        [PreserveSig] int UnregisterAudioSessionNotification(IntPtr client);
+        [PreserveSig] int GetSessionIdentifier([MarshalAs(UnmanagedType.LPWStr)] out string value);
+        [PreserveSig] int GetSessionInstanceIdentifier([MarshalAs(UnmanagedType.LPWStr)] out string value);
+        [PreserveSig] int GetProcessId(out uint pid);
+    }
+
+    [ComImport, Guid("87CE5498-68D6-44E5-9215-6DA47EF883D8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface ISimpleAudioVolume
+    {
+        [PreserveSig] int SetMasterVolume(float level, ref Guid context);
+        [PreserveSig] int GetMasterVolume(out float level);
+        [PreserveSig] int SetMute(bool mute, ref Guid context);
+        [PreserveSig] int GetMute(out bool mute);
+    }
+
+    static bool IsWallpaperProcess(uint pid)
+    {
+        try
+        {
+            using (var p = Process.GetProcessById((int)pid))
+            {
+                string n = p.ProcessName.ToLowerInvariant();
+                return n == "wallpaper32" || n == "wallpaper64" ||
+                       n == "webwallpaper32" || n == "webwallpaper64" ||
+                       n == "wallpaperwindows" ||
+                       n == "wallpaperservice32_engine" || n == "wallpaperservice64_engine";
+            }
+        }
+        catch { return false; }
+    }
+
+    static void Check(int hr)
+    {
+        if (hr < 0) Marshal.ThrowExceptionForHR(hr);
+    }
+
+    static void Release(object value)
+    {
+        if (value != null && Marshal.IsComObject(value)) Marshal.ReleaseComObject(value);
+    }
+
+    public static int SetVolume(float level)
+    {
+        object enumerator = null, manager = null;
+        IMMDevice device = null;
+        IAudioSessionEnumerator sessions = null;
+        int changed = 0;
+        try
+        {
+            enumerator = new MMDeviceEnumeratorComObject();
+            Check(((IMMDeviceEnumerator)enumerator).GetDefaultAudioEndpoint(EDataFlow.Render, ERole.Multimedia, out device));
+
+            Guid managerId = typeof(IAudioSessionManager2).GUID;
+            Check(device.Activate(ref managerId, CLSCTX_ALL, IntPtr.Zero, out manager));
+            Check(((IAudioSessionManager2)manager).GetSessionEnumerator(out sessions));
+
+            int count;
+            Check(sessions.GetCount(out count));
+            Guid context = Guid.Empty;
+            for (int i = 0; i < count; ++i)
+            {
+                IAudioSessionControl control = null;
+                try
+                {
+                    Check(sessions.GetSession(i, out control));
+                    var control2 = control as IAudioSessionControl2;
+                    uint pid;
+                    if (control2 == null || control2.GetProcessId(out pid) < 0 || !IsWallpaperProcess(pid)) continue;
+                    var volume = control as ISimpleAudioVolume;
+                    if (volume == null) continue;
+                    Check(volume.SetMasterVolume(Math.Max(0f, Math.Min(1f, level)), ref context));
+                    ++changed;
+                }
+                finally { Release(control); }
+            }
+            return changed;
+        }
+        finally
+        {
+            Release(sessions);
+            Release(manager);
+            Release(device);
+            Release(enumerator);
+        }
     }
 }
