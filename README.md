@@ -65,7 +65,7 @@ bin\we-codex-bg-ui.exe
 |---|---|
 | **壁纸库**：启动时自动扫描已安装壁纸，按标题/ID/标签搜索，带缩略图 | `--wallpaper` |
 | **壁纸路径**（也可拖拽文件进输入框 / 「浏览」） | `--wallpaper` |
-| **控制模块**：播放/暂停/停止/静音/音量 | `wallpaper64.exe -control ...` |
+| **控制模块**：播放/暂停/停止/静音/音量 | 播放/静音走 `wallpaper64.exe -control ...`；音量只调 Wallpaper Engine 的 Windows 音量会话 |
 | **壁纸参数**：读 `project.json` 的 `general.properties` 动态生成控件 | `-control applyProperties` |
 | **宿主不透明度**（运行中实时生效） | `--alpha 0-255`（默认 235） |
 | **壁纸亮度**（运行中实时生效） | `--wall-alpha 0-255`（默认 255） |
@@ -125,8 +125,8 @@ WE 没开时那串写死的目录基本必然落空；现在走注册表 + `libr
 
 一切都通过 Wallpaper Engine 自己的命令行下发，不去碰它的渲染器：
 
-- **播放控制**：`-control play|pause|stop|mute|unmute`，音量用 `-control volume -value N`
-  （滑块松手才发送 —— WE 每次调用都要起一个进程，逐像素发送会打爆它）。
+- **播放控制**：`-control play|pause|stop|mute|unmute`。官方命令行没有连续音量命令；
+  音量滑块直接调 Windows 音量合成器中 Wallpaper Engine 渲染进程的会话，不会改变 Codex 音量。
 - **壁纸参数**：读选中壁纸 `project.json` 里的 `general.properties`，按 `type` 动态生成控件
   （`bool`→复选框、`slider`→滑块、`combo`→下拉、`color`→RGB 输入+色块、`textinput`→文本框；
   `group`/`text` 渲染成分组标题和说明，和 WE 自己的属性面板一致）。
