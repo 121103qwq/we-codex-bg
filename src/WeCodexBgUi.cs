@@ -1149,7 +1149,7 @@ internal sealed class MainWindow : Window
         catch { return Panel2; }
     }
 
-    // wallpaper64.exe -control applyProperties -properties RAW~({"name":{"value":X}})~
+    // wallpaper64.exe -control applyProperties -properties RAW~({"name":X})~END
     void ApplyProperty(string name, string value)
     {
         _propertyOverrides[name] = value;
@@ -1161,7 +1161,12 @@ internal sealed class MainWindow : Window
     void SendProperties(IEnumerable<KeyValuePair<string, string>> values)
     {
         string json = PropertiesJson(values);
-        if (json != "{}") WeControl("applyProperties", "-properties", "RAW~(" + json + ")~");
+        if (json == "{}") return;
+        string location = _weWindow.Text.Trim();
+        if (location.Length > 0)
+            WeControl("applyProperties", "-properties", "RAW~(" + json + ")~END", "-location", location);
+        else
+            WeControl("applyProperties", "-properties", "RAW~(" + json + ")~END");
     }
 
     static string PropertiesJson(IEnumerable<KeyValuePair<string, string>> values)
@@ -1174,10 +1179,9 @@ internal sealed class MainWindow : Window
             double number;
             bool raw = value == "true" || value == "false" ||
                        double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out number);
-            sb.Append('"').Append(JVal.Escape(item.Key)).Append("\":{\"value\":");
+            sb.Append('"').Append(JVal.Escape(item.Key)).Append("\":");
             if (raw) sb.Append(value);
             else sb.Append('"').Append(JVal.Escape(value)).Append('"');
-            sb.Append('}');
         }
         return sb.Append('}').ToString();
     }
@@ -2119,7 +2123,7 @@ internal sealed class MainWindow : Window
                     foreach (string key in saved.Keys)
                     {
                         JVal entry = saved[key];
-                        JVal value = entry != null ? entry["value"] : null;
+                        JVal value = entry != null && entry.Kind == JKind.Object ? entry["value"] : entry;
                         if (value != null) _propertyOverrides[key] = value.AsString();
                     }
                 }
