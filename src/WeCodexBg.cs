@@ -131,10 +131,12 @@ internal static class WeCodexBg
                                                                      uint flags, uint ms, out IntPtr res);
     [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr h, int id, uint mods, uint vk);
     [DllImport("user32.dll")] static extern bool UnregisterHotKey(IntPtr h, int id);
+    [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr h);
+    [DllImport("gdi32.dll")] static extern IntPtr CreateSolidBrush(uint color);
 
     // ------------------------------------------------------------------ options --
 
-    enum Mode { Composite, Embed, Alpha, Overlay }
+    enum Mode { Composite, Embed, Alpha, Overlay, Adaptive }
     enum Place { ChildBottom, TopLevelBelow, TopLevelAbove }
 
     static Place PlaceOf(Mode m)
@@ -143,7 +145,8 @@ internal static class WeCodexBg
         {
             case Mode.Composite:
             case Mode.Embed: return Place.ChildBottom;
-            case Mode.Alpha: return Place.TopLevelBelow;
+            case Mode.Alpha:
+            case Mode.Adaptive: return Place.TopLevelBelow;
             default: return Place.TopLevelAbove;
         }
     }
@@ -157,7 +160,8 @@ internal static class WeCodexBg
         // alpha default: it only layers the TOP-LEVEL window, which every host
         // tolerates.  composite touches the content child and is unsafe on Chromium.
         public Mode Mode = Mode.Alpha;
-        public byte Alpha = 235, Film = 70, WallAlpha = 255;
+        public byte Alpha = 235, Film = 70, WallAlpha = 255, SideAlpha = 220, InputAlpha = 245;
+        public uint MaskColor = 0x001E1612; // COLORREF for RGB(18,22,30)
         public bool ClientOnly = true, KeepWe = false, Fallback = true;
         public int Fps = 30, Round = 0;
         public bool ListOnly, TreeOnly, RestoreOnly;
@@ -165,7 +169,7 @@ internal static class WeCodexBg
 
     // -------------------------------------------------------------------- state --
 
-    static IntPtr _target, _wall, _content, _msgWnd;
+    static IntPtr _target, _wall, _content, _msgWnd, _sideMask, _inputMask, _maskBrush;
     static IntPtr _targetEx, _contentEx, _wallStyle, _wallEx, _wallParent;
     static bool _targetExSaved, _contentExSaved, _wallSaved, _weLaunched;
     static RECT _lastRect;
@@ -175,13 +179,15 @@ internal static class WeCodexBg
     static Place _place = Place.ChildBottom;
     static bool _clientOnly = true, _keepWe, _verbose;
     // live-adjustable opacity, driven by WM_APP+1 / WM_APP+2 from the UI
-    const uint WM_SET_HOST_ALPHA = 0x8000 + 1, WM_SET_WALL_ALPHA = 0x8000 + 2;
-    static byte _liveHostAlpha = 255, _liveWallAlpha = 255;
+    const uint WM_SET_HOST_ALPHA = 0x8000 + 1, WM_SET_WALL_ALPHA = 0x8000 + 2,
+               WM_SET_SIDE_ALPHA = 0x8000 + 3, WM_SET_INPUT_ALPHA = 0x8000 + 4;
+    static byte _liveHostAlpha = 255, _liveWallAlpha = 255, _liveSideAlpha = 220, _liveInputAlpha = 245;
     static int _round;
     static uint _mainThread;
 
     // keep delegates alive for the lifetime of the process
     static WndProcDelegate _wndProc;
+    static WndProcDelegate _maskProc;
     static WinEventDelegate _winEvent;
     static ConsoleCtrlDelegate _ctrlHandler;
 
@@ -448,6 +454,56 @@ internal static class WeCodexBg
         return true;
     }
 
+    static bool CreateAdaptiveMasks(uint color)
+    {
+        _maskBrush = CreateSolidBrush(color);
+        _maskProc = delegate(IntPtr h, uint m, IntPtr w, IntPtr l) { return DefWindowProcW(h, m, w, l); };
+        var wc = new WNDCLASSEX
+        {
+            cbSize = (uint)Marshal.SizeOf(typeof(WNDCLASSEX)), lpfnWndProc = _maskProc,
+            hInstance = Marshal.GetHINSTANCE(typeof(WeCodexBg).Module),
+            hbrBackground = _maskBrush, lpszClassName = "WeCodexBgMaskCs"
+        };
+        RegisterClassExW(ref wc);
+        uint ex = (uint)(WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW);
+        _sideMask = CreateWindowExW(ex, wc.lpszClassName, "", (uint)WS_POPUP,
+                                    0, 0, 1, 1, IntPtr.Zero, IntPtr.Zero, wc.hInstance, IntPtr.Zero);
+        _inputMask = CreateWindowExW(ex, wc.lpszClassName, "", (uint)WS_POPUP,
+                                     0, 0, 1, 1, IntPtr.Zero, IntPtr.Zero, wc.hInstance, IntPtr.Zero);
+        if (_sideMask == IntPtr.Zero || _inputMask == IntPtr.Zero) return false;
+        SetLayeredWindowAttributes(_sideMask, 0, _liveSideAlpha, LWA_ALPHA);
+        SetLayeredWindowAttributes(_inputMask, 0, _liveInputAlpha, LWA_ALPHA);
+        return true;
+    }
+
+    static void SyncAdaptiveMasks(RECT r, bool force)
+    {
+        int w = r.R - r.L, h = r.B - r.T;
+        uint dpi = GetDpiForWindow(_target);
+        int sideW = Math.Min(w, (int)(280 * dpi / 96));
+        int inset = (int)(22 * dpi / 96);
+        int inputH = Math.Min(h, (int)(150 * dpi / 96));
+        int available = Math.Max(1, w - sideW - inset * 2);
+        int inputW = Math.Min((int)(820 * dpi / 96), available);
+        int inputX = r.L + sideW + (w - sideW - inputW) / 2;
+        int inputY = r.B - inputH - (int)(14 * dpi / 96);
+        bool zBad = GetWindow(_target, GW_HWNDNEXT) != _sideMask ||
+                    GetWindow(_sideMask, GW_HWNDNEXT) != _inputMask ||
+                    GetWindow(_inputMask, GW_HWNDNEXT) != _wall;
+        if (!force && !zBad && Same(r, _lastRect)) return;
+        uint flags = SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING;
+        SetWindowPos(_sideMask, _target, r.L, r.T, sideW, h, flags);
+        SetWindowPos(_inputMask, _sideMask, inputX, inputY, inputW, inputH, flags);
+        IntPtr rgn = CreateRoundRectRgn(0, 0, inputW + 1, inputH + 1,
+                                        (int)(36 * dpi / 96), (int)(36 * dpi / 96));
+        if (rgn != IntPtr.Zero && !SetWindowRgn(_inputMask, rgn, true)) DeleteObject(rgn);
+        SetWindowPos(_wall, _inputMask, r.L, r.T, w, h, flags);
+        ShowWindow(_wall, SW_SHOWNOACTIVATE);
+        ShowWindow(_sideMask, SW_SHOWNOACTIVATE);
+        ShowWindow(_inputMask, SW_SHOWNOACTIVATE);
+        _lastRect = r;
+    }
+
     static void Sync(bool force)
     {
         if (_stopping) return;
@@ -462,7 +518,14 @@ internal static class WeCodexBg
             bool visible = IsWindowVisible(_target) && !IsIconic(_target) && !Cloaked(_target);
             if (!visible)
             {
-                if (!_wallHidden) { ShowWindow(_wall, SW_HIDE); _wallHidden = true; LogV("[sync] target hidden -> wallpaper hidden"); }
+                if (!_wallHidden)
+                {
+                    ShowWindow(_wall, SW_HIDE);
+                    if (_sideMask != IntPtr.Zero) ShowWindow(_sideMask, SW_HIDE);
+                    if (_inputMask != IntPtr.Zero) ShowWindow(_inputMask, SW_HIDE);
+                    _wallHidden = true;
+                    LogV("[sync] target hidden -> wallpaper hidden");
+                }
                 return;
             }
             if (_wallHidden) { _wallHidden = false; force = true; }
@@ -473,6 +536,7 @@ internal static class WeCodexBg
         else { if (!TargetRectOnScreen(_target, _clientOnly, out r)) return; }
         int w = r.R - r.L, h = r.B - r.T;
         if (w <= 0 || h <= 0) return;
+        if (_mode == Mode.Adaptive) { SyncAdaptiveMasks(r, force); return; }
 
         bool sizeChanged = (w != _lastRect.R - _lastRect.L) || (h != _lastRect.B - _lastRect.T);
         bool rectChanged = !Same(r, _lastRect);
@@ -653,6 +717,11 @@ internal static class WeCodexBg
                 _targetExSaved = true;
                 _restored = false;
                 return MakeLayered(_target, o.Alpha);
+            case Mode.Adaptive:
+                _targetEx = GetWindowLongPtrW(_target, GWL_EXSTYLE);
+                _targetExSaved = true;
+                _restored = false;
+                return MakeLayered(_target, o.Alpha) && CreateAdaptiveMasks(o.MaskColor);
             default:
                 return MakeLayered(_wall, o.Film);
         }
@@ -665,6 +734,10 @@ internal static class WeCodexBg
         if (_restored) return;
         _stopping = true;
         _restored = true;
+
+        if (_sideMask != IntPtr.Zero) { DestroyWindow(_sideMask); _sideMask = IntPtr.Zero; }
+        if (_inputMask != IntPtr.Zero) { DestroyWindow(_inputMask); _inputMask = IntPtr.Zero; }
+        if (_maskBrush != IntPtr.Zero) { DeleteObject(_maskBrush); _maskBrush = IntPtr.Zero; }
 
         if (_contentExSaved && _content != IntPtr.Zero && IsWindow(_content))
         {
@@ -828,6 +901,7 @@ Geometry / misc
                     case "--title": case "--class": case "--exe": case "--pid":
                     case "--we": case "--wallpaper": case "--we-window": case "--attach-title":
                     case "--content-class": case "--mode": case "--alpha": case "--film":
+                    case "--wall-alpha": case "--side-alpha": case "--input-alpha": case "--mask-color":
                     case "--fps": case "--round":
                         Log("[!] " + cur + " needs a value");
                         return false;
@@ -853,12 +927,24 @@ Geometry / misc
                         case "embed": o.Mode = Mode.Embed; break;
                         case "alpha": o.Mode = Mode.Alpha; break;
                         case "overlay": o.Mode = Mode.Overlay; break;
+                        case "adaptive": o.Mode = Mode.Adaptive; break;
                         default: Log("[!] unknown mode: " + a[i]); return false;
                     }
                     break;
                 case "--alpha": o.Alpha = (byte)(ParseUInt(a[++i], 205) & 0xFF); break;
                 case "--film": o.Film = (byte)(ParseUInt(a[++i], 70) & 0xFF); break;
                 case "--wall-alpha": o.WallAlpha = (byte)(ParseUInt(a[++i], 255) & 0xFF); break;
+                case "--side-alpha": o.SideAlpha = (byte)(ParseUInt(a[++i], 220) & 0xFF); break;
+                case "--input-alpha": o.InputAlpha = (byte)(ParseUInt(a[++i], 245) & 0xFF); break;
+                case "--mask-color":
+                    {
+                        string s = a[++i].TrimStart('#');
+                        uint rgb;
+                        if (!uint.TryParse(s, System.Globalization.NumberStyles.HexNumber,
+                                           System.Globalization.CultureInfo.InvariantCulture, out rgb)) rgb = 0x12161E;
+                        o.MaskColor = ((rgb & 0xFF) << 16) | (rgb & 0xFF00) | ((rgb >> 16) & 0xFF);
+                        break;
+                    }
                 case "--fps": o.Fps = ParseInt(a[++i], 30); break;
                 case "--round": o.Round = ParseInt(a[++i], 0); break;
                 case "--full": o.ClientOnly = false; break;
@@ -930,6 +1016,8 @@ Geometry / misc
         _round = o.Round;
         _liveHostAlpha = o.Alpha;
         _liveWallAlpha = o.Mode == Mode.Overlay ? o.Film : o.WallAlpha;
+        _liveSideAlpha = o.SideAlpha;
+        _liveInputAlpha = o.InputAlpha;
 
         if (o.ListOnly) { PrintList(); return 0; }
         if (o.RestoreOnly) { RestoreOnly(o); return 0; }
@@ -1010,6 +1098,14 @@ Geometry / misc
                     _liveWallAlpha = (byte)(w.ToInt64() & 0xFF);
                     if (_wall != IntPtr.Zero && IsWindow(_wall))
                         SetLayeredWindowAttributes(_wall, 0, _liveWallAlpha, LWA_ALPHA);
+                    return IntPtr.Zero;
+                case WM_SET_SIDE_ALPHA:
+                    _liveSideAlpha = (byte)(w.ToInt64() & 0xFF);
+                    if (_sideMask != IntPtr.Zero) SetLayeredWindowAttributes(_sideMask, 0, _liveSideAlpha, LWA_ALPHA);
+                    return IntPtr.Zero;
+                case WM_SET_INPUT_ALPHA:
+                    _liveInputAlpha = (byte)(w.ToInt64() & 0xFF);
+                    if (_inputMask != IntPtr.Zero) SetLayeredWindowAttributes(_inputMask, 0, _liveInputAlpha, LWA_ALPHA);
                     return IntPtr.Zero;
                 case 0x0312:                        // WM_HOTKEY: emergency restore
                     Log("[i] 收到紧急还原热键 (Ctrl+Alt+Shift+W)。");

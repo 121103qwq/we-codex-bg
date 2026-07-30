@@ -130,7 +130,7 @@ static bool FileExists(const std::wstring& p) {
 
 // ------------------------------------------------------------------ options ---
 
-enum class Mode { Composite, Embed, Alpha, Overlay };
+enum class Mode { Composite, Embed, Alpha, Overlay, Adaptive };
 enum class Place { ChildBottom, TopLevelBelow, TopLevelAbove };  // wallpaper position
 
 static const wchar_t* ModeName(Mode m) {
@@ -138,6 +138,7 @@ static const wchar_t* ModeName(Mode m) {
     case Mode::Composite: return L"composite";
     case Mode::Embed:     return L"embed";
     case Mode::Alpha:     return L"alpha";
+    case Mode::Adaptive:  return L"adaptive";
     default:              return L"overlay";
     }
 }
@@ -145,7 +146,8 @@ static Place PlaceOf(Mode m) {
     switch (m) {
     case Mode::Composite:
     case Mode::Embed: return Place::ChildBottom;
-    case Mode::Alpha: return Place::TopLevelBelow;
+    case Mode::Alpha:
+    case Mode::Adaptive: return Place::TopLevelBelow;
     default:          return Place::TopLevelAbove;
     }
 }
@@ -162,6 +164,9 @@ struct Options {
     BYTE  alpha      = 235;                    // composite/alpha: host opacity
     BYTE  filmAlpha  = 70;                     // overlay: wallpaper opacity
     BYTE  wallAlpha  = 255;                    // wallpaper brightness in other modes
+    BYTE  sideAlpha  = 220;                    // adaptive: sidebar contrast mask
+    BYTE  inputAlpha = 245;                    // adaptive: composer contrast mask
+    COLORREF maskColor = RGB(18, 22, 30);       // adaptive: derived from preview
     bool  clientOnly = true;
     int   fps        = 30;
     int   round      = 0;
@@ -178,6 +183,7 @@ static const LONG_PTR kWallExAdded = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW |
 
 struct State {
     HWND target = nullptr, wall = nullptr, content = nullptr, msgWnd = nullptr;
+    HWND sideMask = nullptr, inputMask = nullptr;
 
     bool     targetExSaved = false;   LONG_PTR targetEx = 0;
     bool     contentExSaved = false;  LONG_PTR contentEx = 0;
@@ -197,6 +203,9 @@ struct State {
 static State g;
 static BYTE  g_liveHostAlpha = 255;   // live-adjustable opacity (see WM_SET_*_ALPHA)
 static BYTE  g_liveWallAlpha = 255;
+static BYTE  g_liveSideAlpha = 220;
+static BYTE  g_liveInputAlpha = 245;
+static HBRUSH g_maskBrush = nullptr;
 static DWORD g_mainThread = 0;
 static volatile bool g_stopping = false;   // set by RestoreAll: Sync must stop touching windows
 
@@ -439,6 +448,68 @@ static void ApplyRoundedCorners(HWND h, int w, int ht, int radius) {
     if (!SetWindowRgn(h, rgn, TRUE)) DeleteObject(rgn);   // system owns it on success
 }
 
+static LRESULT CALLBACK MaskProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_PAINT) {
+        PAINTSTRUCT ps{};
+        HDC dc = BeginPaint(h, &ps);
+        RECT r{};
+        GetClientRect(h, &r);
+        FillRect(dc, &r, g_maskBrush ? g_maskBrush : (HBRUSH)GetStockObject(BLACK_BRUSH));
+        EndPaint(h, &ps);
+        return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+static bool CreateAdaptiveMasks(COLORREF color) {
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = MaskProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"WeCodexBgMask";
+    RegisterClassExW(&wc);
+
+    if (g_maskBrush) DeleteObject(g_maskBrush);
+    g_maskBrush = CreateSolidBrush(color);
+    DWORD ex = WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
+    g.sideMask = CreateWindowExW(ex, wc.lpszClassName, L"", WS_POPUP,
+                                 0, 0, 1, 1, nullptr, nullptr, wc.hInstance, nullptr);
+    g.inputMask = CreateWindowExW(ex, wc.lpszClassName, L"", WS_POPUP,
+                                  0, 0, 1, 1, nullptr, nullptr, wc.hInstance, nullptr);
+    if (!g.sideMask || !g.inputMask) return false;
+    SetLayeredWindowAttributes(g.sideMask, 0, g_liveSideAlpha, LWA_ALPHA);
+    SetLayeredWindowAttributes(g.inputMask, 0, g_liveInputAlpha, LWA_ALPHA);
+    return true;
+}
+
+static void SyncAdaptiveMasks(const RECT& r, bool force) {
+    int w = r.right - r.left, h = r.bottom - r.top;
+    UINT dpi = GetDpiForWindow(g.target);
+    int sideW = min(w, MulDiv(280, dpi, 96));
+    int inset = MulDiv(22, dpi, 96);
+    int maxInputW = MulDiv(820, dpi, 96);
+    int inputH = min(h, MulDiv(150, dpi, 96));
+    int available = max(1, w - sideW - inset * 2);
+    int inputW = min(maxInputW, available);
+    int inputX = r.left + sideW + (w - sideW - inputW) / 2;
+    int inputY = r.bottom - inputH - MulDiv(14, dpi, 96);
+
+    bool zBad = GetWindow(g.target, GW_HWNDNEXT) != g.sideMask ||
+                GetWindow(g.sideMask, GW_HWNDNEXT) != g.inputMask ||
+                GetWindow(g.inputMask, GW_HWNDNEXT) != g.wall;
+    if (!force && !zBad && SameRect(r, g.lastRect)) return;
+
+    UINT f = SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING;
+    SetWindowPos(g.sideMask, g.target, r.left, r.top, sideW, h, f);
+    SetWindowPos(g.inputMask, g.sideMask, inputX, inputY, inputW, inputH, f);
+    ApplyRoundedCorners(g.inputMask, inputW, inputH, MulDiv(18, dpi, 96));
+    SetWindowPos(g.wall, g.inputMask, r.left, r.top, w, h, f);
+    ShowWindow(g.wall, SW_SHOWNOACTIVATE);
+    ShowWindow(g.sideMask, SW_SHOWNOACTIVATE);
+    ShowWindow(g.inputMask, SW_SHOWNOACTIVATE);
+    g.lastRect = r;
+}
+
 static void Sync(bool force) {
     if (g_stopping) return;
     if (!g.target || !IsWindow(g.target) || !g.wall || !IsWindow(g.wall)) {
@@ -452,6 +523,8 @@ static void Sync(bool force) {
         if (!visible) {
             if (!g.wallHidden) {
                 ShowWindow(g.wall, SW_HIDE);
+                if (g.sideMask) ShowWindow(g.sideMask, SW_HIDE);
+                if (g.inputMask) ShowWindow(g.inputMask, SW_HIDE);
                 g.wallHidden = true;
                 LOGV(L"[sync] target not visible -> wallpaper hidden");
             }
@@ -465,6 +538,11 @@ static void Sync(bool force) {
     else         { if (!TargetRectOnScreen(g.target, g.clientOnly, r)) return; }
     int w = r.right - r.left, h = r.bottom - r.top;
     if (w <= 0 || h <= 0) return;
+
+    if (g.mode == Mode::Adaptive) {
+        SyncAdaptiveMasks(r, force);
+        return;
+    }
 
     bool sizeChanged = (w != g.lastRect.right - g.lastRect.left) ||
                        (h != g.lastRect.bottom - g.lastRect.top);
@@ -657,6 +735,17 @@ static bool ApplyCompositing(const Options& o, Mode m) {
         g.restored = false;
         return MakeLayered(g.target, o.alpha);
 
+    case Mode::Adaptive:
+        g.targetEx = GetWindowLongPtrW(g.target, GWL_EXSTYLE);
+        g.targetExSaved = true;
+        g.restored = false;
+        if (!MakeLayered(g.target, o.alpha)) return false;
+        if (!CreateAdaptiveMasks(o.maskColor)) return false;
+        Out(L"[i] 自适应遮罩：侧栏=%u 输入区=%u 颜色=#%02X%02X%02X",
+            o.sideAlpha, o.inputAlpha,
+            GetRValue(o.maskColor), GetGValue(o.maskColor), GetBValue(o.maskColor));
+        return true;
+
     default:   // Overlay: fade the wallpaper window itself, touch nothing else
         return MakeLayered(g.wall, o.filmAlpha);
     }
@@ -668,6 +757,10 @@ static void RestoreAll() {
     if (g.restored) return;
     g_stopping = true;                 // stop Sync() from touching windows again
     g.restored = true;
+
+    if (g.sideMask) { DestroyWindow(g.sideMask); g.sideMask = nullptr; }
+    if (g.inputMask) { DestroyWindow(g.inputMask); g.inputMask = nullptr; }
+    if (g_maskBrush) { DeleteObject(g_maskBrush); g_maskBrush = nullptr; }
 
     if (g.contentExSaved && g.content && IsWindow(g.content)) {
         SetWindowLongPtrW(g.content, GWL_EXSTYLE, g.contentEx);
@@ -796,6 +889,8 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
 // wallpaper washes the host out, and restarting to try another value is useless.
 #define WM_SET_HOST_ALPHA (WM_APP + 1)
 #define WM_SET_WALL_ALPHA (WM_APP + 2)
+#define WM_SET_SIDE_ALPHA (WM_APP + 3)
+#define WM_SET_INPUT_ALPHA (WM_APP + 4)
 
 // Whichever window this mode made translucent is the one to retune.
 static HWND LayeredHostWindow() {
@@ -837,6 +932,14 @@ static LRESULT CALLBACK MsgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_SET_WALL_ALPHA:
         g_liveWallAlpha = (BYTE)w;
         ApplyLiveWallAlpha();
+        return 0;
+    case WM_SET_SIDE_ALPHA:
+        g_liveSideAlpha = (BYTE)w;
+        if (g.sideMask) SetLayeredWindowAttributes(g.sideMask, 0, g_liveSideAlpha, LWA_ALPHA);
+        return 0;
+    case WM_SET_INPUT_ALPHA:
+        g_liveInputAlpha = (BYTE)w;
+        if (g.inputMask) SetLayeredWindowAttributes(g.inputMask, 0, g_liveInputAlpha, LWA_ALPHA);
         return 0;
     case WM_HOTKEY:
         if (w == HOTKEY_PANIC) {
@@ -890,12 +993,16 @@ L"  --mode composite   embed the wallpaper as the bottom-most child window and f
 L"                     only the content child window (frame stays opaque)  [default]\n"
 L"  --mode embed       embed only, no transparency (plumbing test)\n"
 L"  --mode alpha       wallpaper pinned below the window + whole window translucent\n"
+L"  --mode adaptive    alpha mode plus opaque sidebar / composer contrast masks\n"
 L"  --mode overlay     wallpaper pinned above the window as a click-through film;\n"
 L"                     the Codex window itself is never modified\n"
 L"  --alpha 0-255      host opacity for composite / alpha (default 235)\n"
 L"  --film 0-255       wallpaper opacity for overlay (default 70)\n"
 L"  --wall-alpha 0-255 wallpaper brightness in composite/alpha/embed (default 255);\n"
 L"                     lower it to stop a bright wallpaper washing the host out\n"
+L"  --side-alpha 0-255 adaptive sidebar mask opacity (default 220)\n"
+L"  --input-alpha 0-255 adaptive composer mask opacity (default 245)\n"
+L"  --mask-color RRGGBB adaptive mask color (default 12161E)\n"
 L"  --content-class <s>  which child window class to fade in composite mode\n"
 L"  --no-fallback      do not auto-fall back to the next mode when one fails\n"
 L"\n"
@@ -951,11 +1058,21 @@ static bool ParseArgs(int argc, wchar_t** argv, Options& o) {
             else if (m == L"embed")   o.mode = Mode::Embed;
             else if (m == L"alpha")   o.mode = Mode::Alpha;
             else if (m == L"overlay") o.mode = Mode::Overlay;
+            else if (m == L"adaptive") o.mode = Mode::Adaptive;
             else { Out(L"[!] unknown mode: %ls", m.c_str()); return false; }
         }
         else if (a == L"--alpha") { if (!want(L"--alpha")) return false; o.alpha = (BYTE)wcstoul(argv[++i], nullptr, 10); }
         else if (a == L"--film")  { if (!want(L"--film")) return false; o.filmAlpha = (BYTE)wcstoul(argv[++i], nullptr, 10); }
         else if (a == L"--wall-alpha") { if (!want(L"--wall-alpha")) return false; o.wallAlpha = (BYTE)wcstoul(argv[++i], nullptr, 10); }
+        else if (a == L"--side-alpha") { if (!want(L"--side-alpha")) return false; o.sideAlpha = (BYTE)wcstoul(argv[++i], nullptr, 10); }
+        else if (a == L"--input-alpha") { if (!want(L"--input-alpha")) return false; o.inputAlpha = (BYTE)wcstoul(argv[++i], nullptr, 10); }
+        else if (a == L"--mask-color") {
+            if (!want(L"--mask-color")) return false;
+            const wchar_t* s = argv[++i];
+            if (*s == L'#') ++s;
+            unsigned long rgb = wcstoul(s, nullptr, 16);
+            o.maskColor = RGB((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255);
+        }
         else if (a == L"--fps")   { if (!want(L"--fps")) return false; o.fps = (int)wcstol(argv[++i], nullptr, 10); }
         else if (a == L"--round") { if (!want(L"--round")) return false; o.round = (int)wcstol(argv[++i], nullptr, 10); }
         else if (a == L"--full")     o.clientOnly = false;
@@ -1037,6 +1154,8 @@ int main() {
     g.round = o.round;
     g_liveHostAlpha = o.alpha;
     g_liveWallAlpha = (o.mode == Mode::Overlay) ? o.filmAlpha : o.wallAlpha;
+    g_liveSideAlpha = o.sideAlpha;
+    g_liveInputAlpha = o.inputAlpha;
 
     if (o.listOnly)    { PrintList(); return 0; }
     if (o.restoreOnly) { RestoreOnly(o); return 0; }

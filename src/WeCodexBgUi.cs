@@ -73,9 +73,9 @@ internal sealed class MainWindow : Window
     TextBlock _propHint;
     Slider _volume;
     TextBlock _volumeVal;
-    Slider  _alpha, _film, _wallAlpha;
-    TextBlock _alphaVal, _filmVal, _wallAlphaVal, _statusText, _cmdPreview;
-    Border  _alphaRow, _filmRow, _wallAlphaRow, _embedNote;
+    Slider  _alpha, _film, _wallAlpha, _sideAlpha, _inputAlpha;
+    TextBlock _alphaVal, _filmVal, _wallAlphaVal, _sideAlphaVal, _inputAlphaVal, _maskColorText, _statusText, _cmdPreview;
+    Border  _alphaRow, _filmRow, _wallAlphaRow, _sideAlphaRow, _inputAlphaRow, _embedNote;
     CheckBox _full, _keepWe, _noFallback;
     ComboBox _target;
     Button  _startBtn, _stopBtn, _restoreBtn;
@@ -87,6 +87,7 @@ internal sealed class MainWindow : Window
     // ------------------------------------------------------------------ state --
 
     string _mode = "alpha";       // safe default: never touches the content child
+    string _maskColor = "12161E";
     readonly List<WallpaperItem> _library = new List<WallpaperItem>();
     bool _suppressListSelect;      // set while the list is rebuilt programmatically
     Process _proc;
@@ -291,7 +292,13 @@ internal sealed class MainWindow : Window
             if (_suppressListSelect) return;
             var it = _wpList.SelectedItem as ListBoxItem;
             var w = it != null ? it.Tag as WallpaperItem : null;
-            if (w != null) { _wallpaper.Text = w.ProjectPath; UpdateCommandPreview(); }
+            if (w != null)
+            {
+                _maskColor = w.MaskColor;
+                if (_maskColorText != null) _maskColorText.Text = "#" + _maskColor;
+                _wallpaper.Text = w.ProjectPath;
+                UpdateCommandPreview();
+            }
         };
         sp.Children.Add(_wpList);
 
@@ -322,6 +329,7 @@ internal sealed class MainWindow : Window
         };
         _wallpaper.TextChanged += (s, e) =>
         {
+            UpdateMaskColorForPath(_wallpaper.Text.Trim());
             UpdateCommandPreview();
             if (_propHost != null) LoadProperties(_wallpaper.Text.Trim());
         };
@@ -361,6 +369,7 @@ internal sealed class MainWindow : Window
     sealed class WallpaperItem
     {
         public string Title = "", ProjectPath = "", Type = "", WorkshopId = "", Tags = "";
+        public string MaskColor = "12161E";
         public ImageSource Thumb;
         public string Haystack = "";      // lower-cased title + id + tags, for matching
     }
@@ -383,6 +392,7 @@ internal sealed class MainWindow : Window
                 _library.Clear();
                 _library.AddRange(found);
                 RenderLibrary(_wpSearch.Text);
+                UpdateMaskColorForPath(_wallpaper.Text.Trim());
             });
         }) { IsBackground = true };
         t.SetApartmentState(ApartmentState.STA);   // BitmapImage wants STA
@@ -414,7 +424,11 @@ internal sealed class MainWindow : Window
             if (j.TryGetValue("preview", out v) && v.Length > 0)
             {
                 string img = IOPath.Combine(dir, v);
-                if (File.Exists(img)) w.Thumb = LoadThumb(img);
+                if (File.Exists(img))
+                {
+                    w.Thumb = LoadThumb(img);
+                    w.MaskColor = DominantMaskColor(w.Thumb as BitmapSource);
+                }
             }
             w.Haystack = (w.Title + " " + w.WorkshopId + " " + w.Tags).ToLowerInvariant();
             list.Add(w);
@@ -524,6 +538,53 @@ internal sealed class MainWindow : Window
             return bi;
         }
         catch { return null; }
+    }
+
+    static string DominantMaskColor(BitmapSource src)
+    {
+        if (src == null) return "12161E";
+        try
+        {
+            var bgra = new FormatConvertedBitmap(src, PixelFormats.Bgra32, null, 0);
+            int stride = bgra.PixelWidth * 4;
+            var px = new byte[stride * bgra.PixelHeight];
+            bgra.CopyPixels(px, stride, 0);
+            var bins = new Dictionary<int, int[]>();
+            for (int y = 0; y < bgra.PixelHeight; y += 2)
+            for (int x = 0; x < bgra.PixelWidth; x += 2)
+            {
+                int p = y * stride + x * 4;
+                if (px[p + 3] < 128) continue;
+                int b = px[p], g = px[p + 1], r = px[p + 2];
+                int key = (r >> 4) << 8 | (g >> 4) << 4 | (b >> 4);
+                int[] v;
+                if (!bins.TryGetValue(key, out v)) bins[key] = v = new int[4];
+                v[0] += r; v[1] += g; v[2] += b; v[3]++;
+            }
+            int[] best = null;
+            foreach (var v in bins.Values) if (best == null || v[3] > best[3]) best = v;
+            if (best == null || best[3] == 0) return "12161E";
+            double r0 = best[0] / (double)best[3], g0 = best[1] / (double)best[3], b0 = best[2] / (double)best[3];
+            double luma = r0 * .2126 + g0 * .7152 + b0 * .0722;
+            double f = luma > 1 ? Math.Min(.32, 28 / luma) : .25;
+            int r1 = Math.Max(8, Math.Min(62, (int)(r0 * f)));
+            int g1 = Math.Max(8, Math.Min(62, (int)(g0 * f)));
+            int b1 = Math.Max(8, Math.Min(62, (int)(b0 * f)));
+            return r1.ToString("X2") + g1.ToString("X2") + b1.ToString("X2");
+        }
+        catch { return "12161E"; }
+    }
+
+    void UpdateMaskColorForPath(string path)
+    {
+        foreach (var w in _library)
+        {
+            if (!string.Equals(w.ProjectPath, path, StringComparison.OrdinalIgnoreCase)) continue;
+            _maskColor = w.MaskColor;
+            if (_maskColorText != null) _maskColorText.Text = "自动遮罩色  #" + _maskColor;
+            UpdateCommandPreview();
+            return;
+        }
     }
 
     // -- minimal JSON reader: top-level string values only.  project.json is
@@ -1046,6 +1107,7 @@ internal sealed class MainWindow : Window
         sp.Children.Add(SectionHeader("模式", "动画与 Codex 窗口的合成方式"));
 
         var grid = new UniformGrid { Columns = 2, Margin = new Thickness(0, 10, 0, 0) };
+        grid.Children.Add(ModeCard("adaptive", "自适应 · Adaptive DEV", "壁纸位于下方；侧栏和输入区由独立遮罩提高不透明度，并按壁纸主色自动配色。"));
         grid.Children.Add(ModeCard("alpha", "透明 · Alpha", "钉在窗口正下方，整个窗口半透明。推荐默认，Codex 保持完全可操作。"));
         grid.Children.Add(ModeCard("overlay", "覆盖 · Overlay", "作为可穿透的半透明膜盖在界面上，完全不修改 Codex。最安全。"));
         grid.Children.Add(ModeCard("composite", "合成 · Composite ⚠", "只淡化页面内容、边框保持清晰，但对 Codex/ChatGPT 这类 Electron 宿主会导致界面完全失去鼠标响应，已自动拦截。"));
@@ -1089,12 +1151,16 @@ internal sealed class MainWindow : Window
             c.BorderThickness = new Thickness(sel ? 1.6 : 1);
             c.Background = sel ? B("#1B2436") : Panel2;
         }
-        bool showAlpha = _mode == "composite" || _mode == "alpha";
+        bool showAlpha = _mode == "composite" || _mode == "alpha" || _mode == "adaptive";
         bool showFilm = _mode == "overlay";
+        bool adaptive = _mode == "adaptive";
         _alphaRow.Visibility = showAlpha ? Visibility.Visible : Visibility.Collapsed;
         _filmRow.Visibility = showFilm ? Visibility.Visible : Visibility.Collapsed;
         // the wallpaper is layered in every non-overlay mode, so it can always be dimmed
         _wallAlphaRow.Visibility = showFilm ? Visibility.Collapsed : Visibility.Visible;
+        _sideAlphaRow.Visibility = adaptive ? Visibility.Visible : Visibility.Collapsed;
+        _inputAlphaRow.Visibility = adaptive ? Visibility.Visible : Visibility.Collapsed;
+        if (_maskColorText != null) _maskColorText.Visibility = adaptive ? Visibility.Visible : Visibility.Collapsed;
         _embedNote.Visibility = _mode == "embed" ? Visibility.Visible : Visibility.Collapsed;
     }
 
@@ -1127,6 +1193,35 @@ internal sealed class MainWindow : Window
             SendLiveAlpha(WM_SET_WALL_ALPHA, (int)_wallAlpha.Value);
         };
         sp.Children.Add(_wallAlphaRow);
+
+        _sideAlpha = MakeSlider(0, 255, 220);
+        _sideAlphaVal = ValueBadge("220");
+        _sideAlphaRow = SliderRow("侧边栏遮罩", "越高 = 侧栏越接近不透明", _sideAlpha, _sideAlphaVal);
+        _sideAlpha.ValueChanged += (s, e) =>
+        {
+            _sideAlphaVal.Text = ((int)_sideAlpha.Value).ToString();
+            UpdateCommandPreview();
+            SendLiveAlpha(WM_SET_SIDE_ALPHA, (int)_sideAlpha.Value);
+        };
+        sp.Children.Add(_sideAlphaRow);
+
+        _inputAlpha = MakeSlider(0, 255, 245);
+        _inputAlphaVal = ValueBadge("245");
+        _inputAlphaRow = SliderRow("输入区遮罩", "越高 = 输入框区域越少显示壁纸", _inputAlpha, _inputAlphaVal);
+        _inputAlpha.ValueChanged += (s, e) =>
+        {
+            _inputAlphaVal.Text = ((int)_inputAlpha.Value).ToString();
+            UpdateCommandPreview();
+            SendLiveAlpha(WM_SET_INPUT_ALPHA, (int)_inputAlpha.Value);
+        };
+        sp.Children.Add(_inputAlphaRow);
+
+        _maskColorText = new TextBlock
+        {
+            Text = "#" + _maskColor, Foreground = Muted, FontFamily = Mono,
+            FontSize = 11, Margin = new Thickness(2, 6, 0, 0)
+        };
+        sp.Children.Add(_maskColorText);
 
         _film = MakeSlider(0, 255, 70);
         _filmVal = ValueBadge("70");
@@ -1505,6 +1600,8 @@ internal sealed class MainWindow : Window
     // you are eyeballing contrast against a moving wallpaper.
     const uint WM_SET_HOST_ALPHA = 0x8000 + 1;
     const uint WM_SET_WALL_ALPHA = 0x8000 + 2;
+    const uint WM_SET_SIDE_ALPHA = 0x8000 + 3;
+    const uint WM_SET_INPUT_ALPHA = 0x8000 + 4;
 
     void SendLiveAlpha(uint msg, int value)
     {
@@ -1591,9 +1688,15 @@ internal sealed class MainWindow : Window
         if (wp.Length > 0) { a.Add("--wallpaper"); a.Add(wp); }
 
         a.Add("--mode"); a.Add(_mode);
-        if (_mode == "composite" || _mode == "alpha") { a.Add("--alpha"); a.Add(((int)_alpha.Value).ToString()); }
+        if (_mode == "composite" || _mode == "alpha" || _mode == "adaptive") { a.Add("--alpha"); a.Add(((int)_alpha.Value).ToString()); }
         if (_mode == "overlay") { a.Add("--film"); a.Add(((int)_film.Value).ToString()); }
         else if ((int)_wallAlpha.Value != 255) { a.Add("--wall-alpha"); a.Add(((int)_wallAlpha.Value).ToString()); }
+        if (_mode == "adaptive")
+        {
+            a.Add("--side-alpha"); a.Add(((int)_sideAlpha.Value).ToString());
+            a.Add("--input-alpha"); a.Add(((int)_inputAlpha.Value).ToString());
+            a.Add("--mask-color"); a.Add(_maskColor);
+        }
 
         string we = _we.Text.Trim();
         if (we.Length > 0) { a.Add("--we"); a.Add(we); }
@@ -1702,11 +1805,13 @@ internal sealed class MainWindow : Window
             sb.AppendLine("contentClass=" + _contentClass.Text);
             sb.AppendLine("round=" + _round.Text);
             sb.AppendLine("fps=" + _fps.Text);
-            sb.AppendLine("cfgver=3");
+            sb.AppendLine("cfgver=4");
             sb.AppendLine("mode=" + _mode);
             sb.AppendLine("alpha=" + (int)_alpha.Value);
             sb.AppendLine("film=" + (int)_film.Value);
             sb.AppendLine("wallAlpha=" + (int)_wallAlpha.Value);
+            sb.AppendLine("sideAlpha=" + (int)_sideAlpha.Value);
+            sb.AppendLine("inputAlpha=" + (int)_inputAlpha.Value);
             sb.AppendLine("full=" + (_full.IsChecked == true));
             sb.AppendLine("keepWe=" + (_keepWe.IsChecked == true));
             sb.AppendLine("noFallback=" + (_noFallback.IsChecked == true));
@@ -1748,6 +1853,8 @@ internal sealed class MainWindow : Window
             if (map.TryGetValue("alpha", out v)) _alpha.Value = ParseInt(v, 235);
             if (map.TryGetValue("film", out v)) _film.Value = ParseInt(v, 70);
             if (map.TryGetValue("wallAlpha", out v)) _wallAlpha.Value = ParseInt(v, 255);
+            if (map.TryGetValue("sideAlpha", out v)) _sideAlpha.Value = ParseInt(v, 220);
+            if (map.TryGetValue("inputAlpha", out v)) _inputAlpha.Value = ParseInt(v, 245);
             if (map.TryGetValue("full", out v)) _full.IsChecked = v == "True";
             if (map.TryGetValue("keepWe", out v)) _keepWe.IsChecked = v == "True";
             if (map.TryGetValue("noFallback", out v)) _noFallback.IsChecked = v == "True";

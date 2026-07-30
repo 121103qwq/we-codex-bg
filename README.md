@@ -5,7 +5,7 @@
 这个 helper 只做窗口层面的事情：找窗口 → 把壁纸窗口塞进 Codex 窗口内部最底层 →
 跟随移动/缩放/最大化/最小化/切虚拟桌面 → 退出时原样还原。
 
-色键（`LWA_COLORKEY`）已确认不可行，所以现在走的是**窗口嵌入 + 背景合成**四种模式。
+色键（`LWA_COLORKEY`）已确认不可行，所以现在走的是多种窗口层合成模式。
 
 现在有**中文图形界面**（`we-codex-bg-ui.exe`）：壁纸库自动扫描 + 按标题搜索、模式选择、
 不透明度滑块、播放/参数控制模块、实时日志。命令行版依然完整保留。
@@ -69,7 +69,7 @@ bin\we-codex-bg-ui.exe
 | **壁纸参数**：读 `project.json` 的 `general.properties` 动态生成控件 | `-control applyProperties` |
 | **宿主不透明度**（运行中实时生效） | `--alpha 0-255`（默认 235） |
 | **壁纸亮度**（运行中实时生效） | `--wall-alpha 0-255`（默认 255） |
-| **模式** 四张卡片：合成 / 透明 / 覆盖 / 嵌入 | `--mode composite\|alpha\|overlay\|embed` |
+| **模式**：自适应（DEV）/ 合成 / 透明 / 覆盖 / 嵌入 | `--mode adaptive\|composite\|alpha\|overlay\|embed` |
 | **宿主不透明度** 滑块（合成 / 透明模式下显示） | `--alpha 0-255` |
 | **壁纸膜不透明度** 滑块（覆盖模式下显示） | `--film 0-255` |
 | **目标窗口** 下拉（默认自动检测，可选具体窗口） | `--pid` |
@@ -116,6 +116,19 @@ WE 没开时那串写死的目录基本必然落空；现在走注册表 + `libr
 
 原理上「压暗壁纸」比「淡化界面」更划算：淡化界面会同时把文字一起淡掉，而压暗壁纸只动背景。
 所以默认宿主不透明度从早期的 205 提到了 **235**（旧配置会自动迁移）。
+
+### 自适应模式（开发分支）
+
+`--mode adaptive` 在 `alpha` 模式的基础上，在壁纸与 Codex 之间放两个 helper 自己的
+Win32 纯色窗口：一个覆盖左侧栏，一个覆盖底部输入区。默认侧栏遮罩不透明度为 220，
+输入区为 245；GUI 中都能运行时实时调整。
+
+界面扫描 `preview.jpg` 时会按颜色桶统计主色，再将该颜色压暗为适合白色文字的遮罩色，
+通过 `--mask-color RRGGBB` 传给 helper。这里没有注入或修改 Chromium DOM，因此不会声称
+“改变字体颜色”；实际效果是改变字体下方的局部背景，提高现有字体的对比度。
+
+开发参数：`--side-alpha 0-255`、`--input-alpha 0-255`、`--mask-color RRGGBB`。
+当前几何尺寸按目标窗口 DPI 自动缩放：侧栏基准宽 280px，输入区最大宽 820px、高 150px。
 
 实现上，UI 直接向 helper 的 message-only 窗口 `PostMessage`（`WM_APP+1` / `WM_APP+2`，
 `wParam` 就是 0-255 的 alpha），helper 收到后重新 `SetLayeredWindowAttributes`。
