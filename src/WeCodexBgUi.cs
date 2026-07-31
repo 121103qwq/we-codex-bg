@@ -91,7 +91,6 @@ internal sealed class MainWindow : Window
     string _mode = "alpha";       // safe default: never touches the content child
     string _maskColor = "12161E";
     readonly List<WallpaperItem> _library = new List<WallpaperItem>();
-    readonly Dictionary<string, string> _propertyOverrides = new Dictionary<string, string>(StringComparer.Ordinal);
     bool _suppressListSelect;      // set while the list is rebuilt programmatically
     Process _proc;
     volatile bool _running;
@@ -767,21 +766,6 @@ internal sealed class MainWindow : Window
         return style;
     }
 
-    Style ComboItemStyle()
-    {
-        var style = new Style(typeof(ComboBoxItem));
-        style.Setters.Add(new Setter(Control.ForegroundProperty, Text));
-        style.Setters.Add(new Setter(Control.BackgroundProperty, Panel2));
-        style.Setters.Add(new Setter(Control.PaddingProperty, new Thickness(8, 5, 8, 5)));
-        var hover = new Trigger { Property = ComboBoxItem.IsHighlightedProperty, Value = true };
-        hover.Setters.Add(new Setter(Control.BackgroundProperty, B("#29344A")));
-        style.Triggers.Add(hover);
-        var selected = new Trigger { Property = ComboBoxItem.IsSelectedProperty, Value = true };
-        selected.Setters.Add(new Setter(Control.BackgroundProperty, B("#1B365F")));
-        style.Triggers.Add(selected);
-        return style;
-    }
-
     // control module -----------------------------------------------------------
     //
     // Everything here drives the running wallpaper through Wallpaper Engine's own
@@ -850,26 +834,10 @@ internal sealed class MainWindow : Window
         {
             var psi = new ProcessStartInfo(exe, JoinArgs(args))
             {
-                UseShellExecute = false, CreateNoWindow = true,
-                WorkingDirectory = IOPath.GetDirectoryName(exe)
+                UseShellExecute = false, CreateNoWindow = true
             };
-            var process = Process.Start(psi);
+            Process.Start(psi);
             AppendLog("[we] -control " + cmd + (extra.Length > 0 ? " " + string.Join(" ", extra) : ""), Faint);
-            new Thread(() =>
-            {
-                try
-                {
-                    if (!process.WaitForExit(3000))
-                    {
-                        process.Kill();
-                        Dispatch(() => AppendLog("[!] Wallpaper Engine 控制端未响应，命令已取消。", RedC));
-                    }
-                    else if (process.ExitCode != 0)
-                        Dispatch(() => AppendLog("[!] Wallpaper Engine 控制命令退出码：" + process.ExitCode, RedC));
-                }
-                catch { }
-                finally { try { process.Dispose(); } catch { } }
-            }) { IsBackground = true }.Start();
         }
         catch (Exception ex) { AppendLog("[!] 控制命令失败：" + ex.Message, RedC); }
     }
@@ -899,31 +867,6 @@ internal sealed class MainWindow : Window
             if (File.Exists(c)) return c;
         }
         return null;
-    }
-
-    void EnsureWeController()
-    {
-        if (Process.GetProcessesByName("wallpaper64").Length > 0 ||
-            Process.GetProcessesByName("wallpaper32").Length > 0) return;
-        string exe = ResolveWeExe();
-        if (exe == null) return;
-        string launcher = IOPath.Combine(IOPath.GetDirectoryName(exe), "launcher.exe");
-        if (!File.Exists(launcher)) return;
-        try
-        {
-            Process.Start(new ProcessStartInfo(launcher, "-silent")
-            {
-                UseShellExecute = false, CreateNoWindow = true,
-                WorkingDirectory = IOPath.GetDirectoryName(launcher)
-            });
-            for (int i = 0; i < 30; i++)
-            {
-                Thread.Sleep(100);
-                if (Process.GetProcessesByName("wallpaper64").Length > 0 ||
-                    Process.GetProcessesByName("wallpaper32").Length > 0) return;
-            }
-        }
-        catch (Exception ex) { AppendLog("[!] 启动 Wallpaper Engine 控制端失败：" + ex.Message, RedC); }
     }
 
     // -- properties declared by the wallpaper itself (project.json general.properties) --
@@ -1010,15 +953,13 @@ internal sealed class MainWindow : Window
         var wrap = new StackPanel { Margin = new Thickness(0, 10, 0, 0) };
         var head = new TextBlock { Text = label, Foreground = Text, FontSize = 12,
                                    TextTrimming = TextTrimming.CharacterEllipsis };
-        string saved;
-        bool hasSaved = _propertyOverrides.TryGetValue(name, out saved);
 
         switch (type)
         {
             case "bool":
             {
                 var cb = new CheckBox { Content = label, Foreground = Text, FontSize = 12,
-                                        IsChecked = hasSaved ? saved == "true" : p["value"] != null && p["value"].AsBool(),
+                                        IsChecked = p["value"] != null && p["value"].AsBool(),
                                         Cursor = Cursors.Hand, Margin = new Thickness(0, 8, 0, 0) };
                 cb.Checked += (s, e) => ApplyProperty(name, "true");
                 cb.Unchecked += (s, e) => ApplyProperty(name, "false");
@@ -1032,9 +973,6 @@ internal sealed class MainWindow : Window
                 double max = p["max"] != null ? p["max"].AsNumber(1) : 1;
                 if (max <= min) max = min + 1;
                 double val = p["value"] != null ? p["value"].AsNumber(min) : min;
-                double savedNumber;
-                if (hasSaved && double.TryParse(saved, NumberStyles.Float, CultureInfo.InvariantCulture, out savedNumber))
-                    val = savedNumber;
                 var sl = new Slider { Minimum = min, Maximum = max, Value = Math.Max(min, Math.Min(max, val)),
                                       Foreground = Accent, Height = 24,
                                       IsSnapToTickEnabled = false };
@@ -1051,8 +989,7 @@ internal sealed class MainWindow : Window
                 var cbx = new ComboBox { Height = 32, Background = Panel2, Foreground = Text,
                                          BorderBrush = Stroke, BorderThickness = new Thickness(1),
                                          Margin = new Thickness(0, 4, 0, 0),
-                                         VerticalContentAlignment = VerticalAlignment.Center,
-                                         ItemContainerStyle = ComboItemStyle() };
+                                         VerticalContentAlignment = VerticalAlignment.Center };
                 var values = new List<string>();
                 JVal opts = p["options"];
                 if (opts != null && opts.Kind == JKind.Array)
@@ -1063,7 +1000,7 @@ internal sealed class MainWindow : Window
                         values.Add(v);
                         cbx.Items.Add(t);
                     }
-                string cur = hasSaved ? saved : p["value"] != null ? p["value"].AsString() : "";
+                string cur = p["value"] != null ? p["value"].AsString() : "";
                 int idx = values.IndexOf(cur);
                 if (idx >= 0) cbx.SelectedIndex = idx;
                 cbx.SelectionChanged += (s, e) =>
@@ -1083,7 +1020,7 @@ internal sealed class MainWindow : Window
             case "color":
             {
                 // WE colours are "r g b" floats in 0..1
-                string cur = hasSaved ? saved : p["value"] != null ? p["value"].AsString("1 1 1") : "1 1 1";
+                string cur = p["value"] != null ? p["value"].AsString("1 1 1") : "1 1 1";
                 var tb = Input(cur);
                 tb.Height = 32;
                 var sw = new Border { Width = 32, Height = 32, CornerRadius = new CornerRadius(6),
@@ -1105,7 +1042,7 @@ internal sealed class MainWindow : Window
             }
             case "textinput":
             {
-                var tb = Input(hasSaved ? saved : p["value"] != null ? p["value"].AsString() : "");
+                var tb = Input(p["value"] != null ? p["value"].AsString() : "");
                 tb.Height = 32;
                 tb.Margin = new Thickness(0, 4, 0, 0);
                 tb.LostKeyboardFocus += (s, e) => ApplyProperty(name, tb.Text);
@@ -1152,43 +1089,18 @@ internal sealed class MainWindow : Window
     // wallpaper64.exe -control applyProperties -properties RAW~({"name":{"value":X}})~
     void ApplyProperty(string name, string value)
     {
-        _propertyOverrides[name] = value;
-        SaveSettings();
-        var one = new Dictionary<string, string>(StringComparer.Ordinal) { { name, value } };
-        SendProperties(one);
-    }
+        bool numeric;
+        double d;
+        numeric = double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out d);
+        string json;
+        if (value == "true" || value == "false")
+            json = "{\"" + JVal.Escape(name) + "\":{\"value\":" + value + "}}";
+        else if (numeric)
+            json = "{\"" + JVal.Escape(name) + "\":{\"value\":" + value + "}}";
+        else
+            json = "{\"" + JVal.Escape(name) + "\":{\"value\":\"" + JVal.Escape(value) + "\"}}";
 
-    void SendProperties(IEnumerable<KeyValuePair<string, string>> values)
-    {
-        string json = PropertiesJson(values);
-        if (json != "{}") WeControl("applyProperties", "-properties", "RAW~(" + json + ")~");
-    }
-
-    static string PropertiesJson(IEnumerable<KeyValuePair<string, string>> values)
-    {
-        var sb = new StringBuilder("{");
-        foreach (var item in values)
-        {
-            if (sb.Length > 1) sb.Append(',');
-            string value = item.Value ?? "";
-            double number;
-            bool raw = value == "true" || value == "false" ||
-                       double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out number);
-            sb.Append('"').Append(JVal.Escape(item.Key)).Append("\":{\"value\":");
-            if (raw) sb.Append(value);
-            else sb.Append('"').Append(JVal.Escape(value)).Append('"');
-            sb.Append('}');
-        }
-        return sb.Append('}').ToString();
-    }
-
-    void ReplayPropertyOverrides()
-    {
-        if (_running && _propertyOverrides.Count > 0)
-        {
-            AppendLog("[we] 正在恢复 " + _propertyOverrides.Count + " 项壁纸参数…", Faint);
-            SendProperties(_propertyOverrides);
-        }
+        WeControl("applyProperties", "-properties", "RAW~(" + json + ")~");
     }
 
     // mode selector ------------------------------------------------------------
@@ -1404,8 +1316,7 @@ internal sealed class MainWindow : Window
         {
             Height = 38, Background = Panel2, Foreground = Text, BorderBrush = Stroke,
             BorderThickness = new Thickness(1), Padding = new Thickness(10, 0, 6, 0),
-            VerticalContentAlignment = VerticalAlignment.Center,
-            ItemContainerStyle = ComboItemStyle()
+            VerticalContentAlignment = VerticalAlignment.Center
         };
         _target.SelectionChanged += (s, e) => UpdateCommandPreview();
         Grid.SetColumn(_target, 0);
@@ -1633,8 +1544,6 @@ internal sealed class MainWindow : Window
             return;
         }
 
-        EnsureWeController();
-
         if (_mode == "glass")
         {
             try
@@ -1683,12 +1592,6 @@ internal sealed class MainWindow : Window
         SetRunningUi(true);
         SaveSettings();
         AppendLog("\u25B6 \u5DF2\u542F\u52A8  (" + _mode + ")", GreenC);
-        if (_propertyOverrides.Count > 0)
-        {
-            var replay = new DispatcherTimer { Interval = TimeSpan.FromSeconds(3) };
-            replay.Tick += (s, e) => { replay.Stop(); ReplayPropertyOverrides(); };
-            replay.Start();
-        }
     }
 
     void StopClicked()
@@ -1847,13 +1750,8 @@ internal sealed class MainWindow : Window
   --color-token-foreground: #f5f7ff !important;
   --color-token-icon-foreground: #f5f7ff !important;
   --color-token-description-foreground: rgba(238,242,255,.76) !important;
-  --color-token-dropdown-background: rgba(18,23,34,.96) !important;
-  --color-token-dropdown-foreground: #f5f7ff !important;
-  --color-token-menu-background: rgba(18,23,34,.96) !important;
-  --color-token-menu-border: rgba(255,255,255,.18) !important;
-  --color-token-application-menu-background: #121722 !important;
-  --color-token-application-menu-foreground: #f5f7ff !important;
-  --color-token-editor-widget-background: rgba(18,23,34,.96) !important;
+  --color-token-input-foreground: #f7f9ff !important;
+  --color-token-input-placeholder-foreground: rgba(238,242,255,.62) !important;
   --color-token-text-code-block-background: rgba(5,9,18,.76) !important;
   --color-token-text-preformat-background: rgba(5,9,18,.82) !important;
   --color-token-text-preformat-foreground: #f7f9ff !important;
@@ -1864,7 +1762,10 @@ internal sealed class MainWindow : Window
     rgba(7,11,20," + a + @") calc(100% - 16px), transparent calc(100% - 16px)) !important;
 }
 .app-shell-left-panel { background: rgba(5,9,18,.24) !important; }
-";
+.composer-surface-chrome {
+  background: rgba(20,24,34,.90) !important;
+  color: #f7f9ff !important;
+}";
         string expression = "(() => { let s=document.getElementById('we-codex-embed-theme');" +
             "if(!s){s=document.createElement('style');s.id='we-codex-embed-theme';document.documentElement.appendChild(s);}" +
             "s.textContent=\"" + JVal.Escape(css) + "\";return true;})()";
@@ -2088,8 +1989,6 @@ internal sealed class MainWindow : Window
             sb.AppendLine("surfaceAlpha=" + (int)_surfaceAlpha.Value);
             sb.AppendLine("sideAlpha=" + (int)_sideAlpha.Value);
             sb.AppendLine("inputAlpha=" + (int)_inputAlpha.Value);
-            string propJson = PropertiesJson(_propertyOverrides);
-            sb.AppendLine("propertyOverrides=" + Convert.ToBase64String(Encoding.UTF8.GetBytes(propJson)));
             sb.AppendLine("full=" + (_full.IsChecked == true));
             sb.AppendLine("keepWe=" + (_keepWe.IsChecked == true));
             sb.AppendLine("noFallback=" + (_noFallback.IsChecked == true));
@@ -2111,20 +2010,6 @@ internal sealed class MainWindow : Window
                 map[raw.Substring(0, eq)] = raw.Substring(eq + 1);
             }
             string v;
-            if (map.TryGetValue("propertyOverrides", out v) && v.Length > 0)
-            {
-                try
-                {
-                    JVal saved = JVal.Parse(Encoding.UTF8.GetString(Convert.FromBase64String(v)));
-                    foreach (string key in saved.Keys)
-                    {
-                        JVal entry = saved[key];
-                        JVal value = entry != null ? entry["value"] : null;
-                        if (value != null) _propertyOverrides[key] = value.AsString();
-                    }
-                }
-                catch { }
-            }
             if (map.TryGetValue("wallpaper", out v)) _wallpaper.Text = v;
             if (map.TryGetValue("we", out v)) _we.Text = v;
             if (map.TryGetValue("weWindow", out v) && v.Length > 0) _weWindow.Text = v;
