@@ -677,7 +677,7 @@ internal sealed class MainWindow : Window
             if (!IsDarkWallpaper(preview)) return;
             Dispatch(() =>
             {
-                if (version != _toneCheckVersion) return;
+                if (version != _toneCheckVersion || !_running) return;
                 try
                 {
                     ApplyAutoDarkMode();
