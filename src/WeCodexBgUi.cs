@@ -62,6 +62,7 @@ internal sealed class MainWindow : Window
     static readonly Brush YellowC  = B("#E3B341");
 
     static readonly FontFamily Mono = new FontFamily("Cascadia Mono, Consolas, Menlo, monospace");
+    static readonly bool EnableWallpaperPropertyControl = false;
 
     // ---------------------------------------------------------------- controls --
 
@@ -69,8 +70,8 @@ internal sealed class MainWindow : Window
     TextBox _wpSearch;
     ListBox _wpList;
     TextBlock _wpCount;
-    StackPanel _propHost;              // dynamic wallpaper-property controls
-    TextBlock _propHint;
+    StackPanel _propHost = null;       // dynamic wallpaper-property controls disabled
+    TextBlock _propHint = null;
     Slider _volume;
     TextBlock _volumeVal;
     Slider  _alpha, _film, _wallAlpha, _sideAlpha, _inputAlpha;
@@ -331,7 +332,8 @@ internal sealed class MainWindow : Window
         {
             UpdateMaskColorForPath(_wallpaper.Text.Trim());
             UpdateCommandPreview();
-            if (_propHost != null) LoadProperties(_wallpaper.Text.Trim());
+            if (EnableWallpaperPropertyControl && _propHost != null)
+                LoadProperties(_wallpaper.Text.Trim());
         };
         Grid.SetColumn(_wallpaper, 0);
         row.Children.Add(_wallpaper);
@@ -770,7 +772,7 @@ internal sealed class MainWindow : Window
     {
         var card = Card();
         var sp = (StackPanel)card.Child;
-        sp.Children.Add(SectionHeader("控制", "播放与壁纸自身的参数，实时生效"));
+        sp.Children.Add(SectionHeader("控制", "播放控制"));
 
         // -- transport row --
         var row = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 10, 0, 0) };
@@ -789,15 +791,6 @@ internal sealed class MainWindow : Window
         _volume.PreviewMouseUp += (s, e) => WeControl("volume", "-value", ((int)_volume.Value).ToString());
         sp.Children.Add(SliderRow("音量", "拖动结束后应用", _volume, _volumeVal));
 
-        // -- dynamic wallpaper properties --
-        _propHint = new TextBlock
-        {
-            Text = "选择一张壁纸后，这里会列出它自己的可调参数。", Foreground = Faint,
-            FontSize = 11, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 12, 0, 0)
-        };
-        sp.Children.Add(_propHint);
-        _propHost = new StackPanel { Margin = new Thickness(0, 4, 0, 0) };
-        sp.Children.Add(_propHost);
         return card;
     }
 
@@ -875,6 +868,7 @@ internal sealed class MainWindow : Window
 
     void LoadProperties(string projectJsonPath)
     {
+        if (!EnableWallpaperPropertyControl) return;
         _props.Clear();
         _propHost.Children.Clear();
 
@@ -1084,6 +1078,7 @@ internal sealed class MainWindow : Window
     // wallpaper64.exe -control applyProperties -properties RAW~({"name":{"value":X}})~
     void ApplyProperty(string name, string value)
     {
+        if (!EnableWallpaperPropertyControl) return;
         bool numeric;
         double d;
         numeric = double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out d);
