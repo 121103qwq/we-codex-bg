@@ -181,6 +181,8 @@ struct Options {
 static const LONG_PTR kWallExAdded = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW |
                                      WS_EX_TRANSPARENT | WS_EX_LAYERED;
 
+struct StyleSnapshot { HWND hwnd; LONG_PTR ex; };
+
 struct State {
     HWND target = nullptr, wall = nullptr, content = nullptr, msgWnd = nullptr;
     HWND sideMask = nullptr, inputMask = nullptr;
@@ -189,6 +191,7 @@ struct State {
     bool     contentExSaved = false;  LONG_PTR contentEx = 0;
     bool     wallSaved = false;       LONG_PTR wallStyle = 0, wallEx = 0;
     HWND     wallParent = nullptr;
+    std::vector<StyleSnapshot> wallChildStyles;
     bool     weLaunched = false;
 
     RECT lastRect{ 0, 0, 0, 0 };
@@ -208,6 +211,7 @@ static BYTE  g_liveInputAlpha = 245;
 static HBRUSH g_maskBrush = nullptr;
 static DWORD g_mainThread = 0;
 static volatile bool g_stopping = false;   // set by RestoreAll: Sync must stop touching windows
+static volatile LONG g_restoreStarted = 0; // RestoreAll can be entered by hooks and WM_CLOSE
 
 // ------------------------------------------------------------- window lookup ---
 
@@ -627,6 +631,11 @@ static void MakeClickThroughTree(HWND root) {
     EnumChildWindows(root, ClickThroughProc, 0);
 }
 
+static BOOL CALLBACK SaveWallChildStyleProc(HWND c, LPARAM) {
+    g.wallChildStyles.push_back({ c, GetWindowLongPtrW(c, GWL_EXSTYLE) });
+    return TRUE;
+}
+
 // Safety net: if the host stops answering messages while we are attached, undo
 // everything rather than leaving the user with a window they cannot click.
 static int g_hangStrikes = 0;
@@ -641,6 +650,9 @@ static void PrepareWallWindow() {
     g.wallEx    = GetWindowLongPtrW(g.wall, GWL_EXSTYLE);
     g.wallParent = GetAncestor(g.wall, GA_PARENT);          // real parent, not the owner
     if (g.wallParent == GetDesktopWindow()) g.wallParent = nullptr;
+    g.wallChildStyles.clear();
+    EnumChildWindows(g.wall, SaveWallChildStyleProc, 0);
+    InterlockedExchange(&g_restoreStarted, 0);
     g.wallSaved = true;
     g.restored  = false;
 
@@ -755,6 +767,7 @@ static bool ApplyCompositing(const Options& o, Mode m) {
 
 static void RestoreAll() {
     if (g.restored) return;
+    if (InterlockedCompareExchange(&g_restoreStarted, 1, 0) != 0) return;
     g_stopping = true;                 // stop Sync() from touching windows again
     g.restored = true;
 
@@ -770,6 +783,13 @@ static void RestoreAll() {
         SetWindowLongPtrW(g.target, GWL_EXSTYLE, g.targetEx);
         ForceRepaint(g.target);
     }
+    for (const auto& saved : g.wallChildStyles) {
+        if (IsWindow(saved.hwnd)) {
+            SetWindowLongPtrW(saved.hwnd, GWL_EXSTYLE, saved.ex);
+            ForceRepaint(saved.hwnd);
+        }
+    }
+    g.wallChildStyles.clear();
     if (g.wallSaved && g.wall && IsWindow(g.wall)) {
         SetWindowRgn(g.wall, nullptr, TRUE);
         // restore the styles first, then un-parent: a WS_CHILD window whose parent
@@ -814,6 +834,9 @@ static void RestoreOnly(const Options& o) {
     HWND t = FindTarget(o);
     if (!t) { Out(L"[!] 未找到目标窗口（残留壁纸窗口已清理）。"); return; }
 
+    HWND content = nullptr;
+    if (o.mode == Mode::Composite) content = PickContentChild(t, o.contentClass);
+
     std::vector<HWND> all{ t };
     EnumChildWindows(t, CollectAllProc, reinterpret_cast<LPARAM>(&all));  // snapshot first
 
@@ -835,7 +858,8 @@ static void RestoreOnly(const Options& o) {
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
             ShowWindow(h, SW_SHOWNOACTIVATE);   // stay findable / closable
             ++fixed;
-        } else if (ex & WS_EX_LAYERED) {
+        } else if (h == t || (h == content && content != nullptr)) {
+            if (!(ex & WS_EX_LAYERED)) continue;
             SetWindowLongPtrW(h, GWL_EXSTYLE, ex & ~WS_EX_LAYERED);
             ForceRepaint(h);
             ++fixed;
@@ -850,14 +874,19 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
                                   LONG idObject, LONG, DWORD, DWORD) {
     switch (event) {
     case EVENT_OBJECT_DESTROY:
-    case EVENT_OBJECT_HIDE:
         // The target is going away.  In child placement the wallpaper window would
         // be destroyed with its parent, so restore right now, while it still exists.
         if (hwnd == g.target && idObject == OBJID_WINDOW) {
-            LOGV(L"[hook] target %ls", event == EVENT_OBJECT_HIDE ? L"hidden" : L"destroyed");
+            LOGV(L"[hook] target destroyed");
             RestoreAll();
             PostThreadMessageW(g_mainThread, WM_QUIT, 0, 0);
         }
+        return;
+
+    case EVENT_OBJECT_HIDE:
+        // Minimize also emits OBJECT_HIDE.  Let Sync hide the wallpaper and keep
+        // the helper alive so it can be shown again on restore.
+        if (hwnd == g.target && idObject == OBJID_WINDOW) Sync(false);
         return;
 
     case EVENT_OBJECT_LOCATIONCHANGE:
@@ -990,9 +1019,9 @@ L"Usage: we-codex-bg.exe [options]\n"
 L"\n"
 L"Modes\n"
 L"  --mode composite   embed the wallpaper as the bottom-most child window and fade\n"
-L"                     only the content child window (frame stays opaque)  [default]\n"
+L"                     only the content child window (frame stays opaque)\n"
 L"  --mode embed       embed only, no transparency (plumbing test)\n"
-L"  --mode alpha       wallpaper pinned below the window + whole window translucent\n"
+L"  --mode alpha       wallpaper pinned below the window + whole window translucent [default]\n"
 L"  --mode adaptive    alpha mode plus opaque sidebar / composer contrast masks\n"
 L"  --mode overlay     wallpaper pinned above the window as a click-through film;\n"
 L"                     the Codex window itself is never modified\n"

@@ -94,6 +94,7 @@ internal sealed class MainWindow : Window
     readonly List<WallpaperItem> _library = new List<WallpaperItem>();
     readonly object _themeLock = new object();
     bool _autoDarkThemeActive;
+    int _autoDarkRunId;
     int _toneCheckVersion;
     bool _suppressListSelect;      // set while the list is rebuilt programmatically
     Process _proc;
@@ -680,7 +681,7 @@ internal sealed class MainWindow : Window
                 if (version != _toneCheckVersion || !_running) return;
                 try
                 {
-                    ApplyAutoDarkMode();
+                    ApplyAutoDarkMode(version);
                     AppendLog("[i] 已根据壁纸主色切换深色模式。", GreenC);
                     MessageBox.Show(this, "深色模式在该壁纸中表现的通常更好", "壁纸主题提示",
                                     MessageBoxButton.OK, MessageBoxImage.Information);
@@ -1671,13 +1672,14 @@ internal sealed class MainWindow : Window
         AppendLog("\u25A0 \u6B63\u5728\u505C\u6B62\u2026", YellowC);
 
         var proc = _proc;
-        var t = new Thread(() => GracefulStop(proc, 5000)) { IsBackground = true };
+        var restoreArgs = BuildRestoreArgs();
+        var t = new Thread(() => GracefulStop(proc, 5000, restoreArgs)) { IsBackground = true };
         t.Start();
     }
 
     // Post WM_CLOSE to the helper's message-only window so it runs RestoreAll();
     // if it doesn't exit in time, kill it and run --restore to clean up.
-    void GracefulStop(Process proc, int timeoutMs)
+    void GracefulStop(Process proc, int timeoutMs, List<string> restoreArgs)
     {
         try
         {
@@ -1689,7 +1691,7 @@ internal sealed class MainWindow : Window
                 Dispatch(() => AppendLog("[!] 未正常退出 —— 强制结束并执行 --restore", YellowC));
                 try { proc.Kill(); } catch { }
                 try { proc.WaitForExit(2000); } catch { }
-                RunRestoreSilent();
+                RunRestoreSilent(restoreArgs);
             }
         }
         catch (Exception ex) { Dispatch(() => AppendLog("[!] 停止出错：" + ex.Message, RedC)); }
@@ -1747,23 +1749,26 @@ internal sealed class MainWindow : Window
         AppendLog("\u25CF \u5DF2\u505C\u6B62  (\u9000\u51FA\u7801 " + code + ")", code == 0 ? Muted : RedC);
         try { if (_proc != null) _proc.Dispose(); } catch { }
         _proc = null;
-        if (_autoDarkThemeActive)
-            new Thread(RemoveAutoDarkMode) { IsBackground = true }.Start();
+        int darkRunId;
+        lock (_themeLock) { darkRunId = _autoDarkRunId; }
+        if (darkRunId != 0)
+            new Thread(() => RemoveAutoDarkMode(darkRunId)) { IsBackground = true }.Start();
     }
 
     void RunRestore()
     {
         if (!File.Exists(HelperPath)) { AppendLog("[!] \u627E\u4E0D\u5230\u8F85\u52A9\u7A0B\u5E8F exe\u3002", RedC); return; }
         AppendLog("\u21BA \u6B63\u5728\u6267\u884C --restore\u2026", YellowC);
-        var t = new Thread(RunRestoreSilent) { IsBackground = true };
+        var restoreArgs = BuildRestoreArgs();
+        var t = new Thread(() => RunRestoreSilent(restoreArgs)) { IsBackground = true };
         t.Start();
     }
 
-    void RunRestoreSilent()
+    void RunRestoreSilent(List<string> args)
     {
         try
         {
-            var psi = new ProcessStartInfo(HelperPath, "--restore")
+            var psi = new ProcessStartInfo(HelperPath, JoinArgs(args))
             {
                 UseShellExecute = false, CreateNoWindow = true,
                 RedirectStandardOutput = true, RedirectStandardError = true,
@@ -1781,7 +1786,7 @@ internal sealed class MainWindow : Window
         catch (Exception ex) { Dispatch(() => AppendLog("[!] 恢复失败：" + ex.Message, RedC)); }
     }
 
-    void ApplyAutoDarkMode()
+    void ApplyAutoDarkMode(int runId)
     {
         string css = @"
 :root {
@@ -1807,17 +1812,19 @@ html, body { background: #0f1116 !important; color: #f5f7ff !important; }
         {
             CdpEvaluate(expression);
             _autoDarkThemeActive = true;
+            _autoDarkRunId = runId;
         }
     }
 
-    void RemoveAutoDarkMode()
+    void RemoveAutoDarkMode(int runId)
     {
         lock (_themeLock)
         {
-            if (!_autoDarkThemeActive) return;
+            if (!_autoDarkThemeActive || _autoDarkRunId != runId) return;
             try { CdpEvaluate("(() => { const s=document.getElementById('we-codex-auto-dark');if(s)s.remove();return true;})()"); }
             catch { }
             _autoDarkThemeActive = false;
+            _autoDarkRunId = 0;
         }
     }
 
@@ -1885,6 +1892,20 @@ html, body { background: #0f1116 !important; color: #f5f7ff !important; }
     }
 
     // ------------------------------------------------------------- args build --
+
+    List<string> BuildRestoreArgs()
+    {
+        var a = new List<string> { "--restore" };
+        var sel = _target != null ? _target.SelectedItem as WinItem : null;
+        if (sel != null && sel.Pid != 0) { a.Add("--pid"); a.Add(sel.Pid.ToString()); }
+
+        string ww = _weWindow.Text.Trim();
+        if (ww.Length > 0) { a.Add("--we-window"); a.Add(ww); }
+        string cc = _contentClass.Text.Trim();
+        if (cc.Length > 0) { a.Add("--content-class"); a.Add(cc); }
+        if (_mode.Length > 0) { a.Add("--mode"); a.Add(_mode); }
+        return a;
+    }
 
     List<string> BuildArgs()
     {
@@ -2054,8 +2075,8 @@ html, body { background: #0f1116 !important; color: #f5f7ff !important; }
             if (cfgver < 2 && _mode == "composite") _mode = "alpha";
             // cfgver 3: the old 205 host opacity washes the UI out under a bright
             // wallpaper.  Nudge anyone still on it up to the readable default.
-            if (cfgver < 3 && (int)_alpha.Value <= 205) _alpha.Value = 235;
             if (map.TryGetValue("alpha", out v)) _alpha.Value = ParseInt(v, 235);
+            if (cfgver < 3 && (int)_alpha.Value <= 205) _alpha.Value = 235;
             if (map.TryGetValue("film", out v)) _film.Value = ParseInt(v, 70);
             if (map.TryGetValue("wallAlpha", out v)) _wallAlpha.Value = ParseInt(v, 255);
             if (map.TryGetValue("sideAlpha", out v)) _sideAlpha.Value = ParseInt(v, 220);
@@ -2077,17 +2098,20 @@ html, body { background: #0f1116 !important; color: #f5f7ff !important; }
             try
             {
                 var proc = _proc;
+                var restoreArgs = BuildRestoreArgs();
                 IntPtr msg = FindHelperMsgWindow(proc.Id);
                 if (msg != IntPtr.Zero) Native.PostMessage(msg, 0x0010, IntPtr.Zero, IntPtr.Zero);
                 if (!proc.WaitForExit(4000))
                 {
                     try { proc.Kill(); } catch { }
-                    RunRestoreSilent();
+                    RunRestoreSilent(restoreArgs);
                 }
             }
             catch { }
         }
-        RemoveAutoDarkMode();
+        int darkRunId;
+        lock (_themeLock) { darkRunId = _autoDarkRunId; }
+        if (darkRunId != 0) RemoveAutoDarkMode(darkRunId);
     }
 
     // -------------------------------------------------------- widget factories --

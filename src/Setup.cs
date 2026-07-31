@@ -19,6 +19,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Reflection;
 using System.Text;
+using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
@@ -182,10 +183,84 @@ internal static class SetupProgram
     static void TryStopRunning(string exePath)
     {
         if (!File.Exists(exePath)) return;
-        string want = IOPath.GetFileNameWithoutExtension(exePath);
-        foreach (Process p in Process.GetProcessesByName(want))
+        string want = NormalizePath(exePath);
+        List<Process> hits = new List<Process>();
+        foreach (Process p in Process.GetProcesses())
         {
-            try { p.Kill(); p.WaitForExit(3000); } catch { }
+            try
+            {
+                if (SamePath(p.MainModule.FileName, want)) hits.Add(p);
+            }
+            catch { }
+        }
+        if (hits.Count == 0) return;
+
+        foreach (Process p in hits) TryCloseProcess(p);
+        WaitForExit(hits, 4000);
+
+        if (string.Equals(IOPath.GetFileName(want), "we-codex-bg.exe", StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                Process.Start(new ProcessStartInfo(want, "--restore")
+                { CreateNoWindow = true, UseShellExecute = false });
+            }
+            catch { }
+            WaitForExit(hits, 2000);
+        }
+
+        foreach (Process p in hits)
+        {
+            try { if (!p.HasExited) p.Kill(); } catch { }
+        }
+        WaitForExit(hits, 2000);
+    }
+
+    static string NormalizePath(string path)
+    {
+        try { return IOPath.GetFullPath(path).TrimEnd(IOPath.DirectorySeparatorChar, IOPath.AltDirectorySeparatorChar); }
+        catch { return (path ?? "").TrimEnd(IOPath.DirectorySeparatorChar, IOPath.AltDirectorySeparatorChar); }
+    }
+
+    static bool SamePath(string a, string b)
+    {
+        return string.Equals(NormalizePath(a), NormalizePath(b), StringComparison.OrdinalIgnoreCase);
+    }
+
+    static void TryCloseProcess(Process p)
+    {
+        try { p.CloseMainWindow(); } catch { }
+        try
+        {
+            foreach (ProcessThread t in p.Threads)
+            {
+                EnumThreadWindows((uint)t.Id, (h, lp) =>
+                {
+                    IntPtr res;
+                    SendMessageTimeout(h, WM_CLOSE, IntPtr.Zero, IntPtr.Zero, SMTO_ABORTIFHUNG, 150, out res);
+                    return true;
+                }, IntPtr.Zero);
+            }
+        }
+        catch { }
+    }
+
+    static void WaitForExit(List<Process> ps, int timeoutMs)
+    {
+        var sw = Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < timeoutMs)
+        {
+            bool any = false;
+            foreach (Process p in ps)
+            {
+                try
+                {
+                    if (!p.HasExited) { any = true; break; }
+                }
+                catch { }
+            }
+            if (!any) return;
+            System.Threading.Thread.Sleep(100);
         }
     }
 
@@ -216,6 +291,18 @@ internal static class SetupProgram
         }
         catch { }
     }
+
+    const uint WM_CLOSE = 0x0010;
+    const uint SMTO_ABORTIFHUNG = 0x0002;
+
+    delegate bool EnumThreadWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    static extern bool EnumThreadWindows(uint dwThreadId, EnumThreadWindowsProc lpfn, IntPtr lParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern bool SendMessageTimeout(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam,
+                                          uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
 }
 
 // ------------------------------------------------------------------ installer UI --

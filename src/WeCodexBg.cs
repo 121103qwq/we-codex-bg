@@ -171,10 +171,13 @@ internal static class WeCodexBg
 
     static IntPtr _target, _wall, _content, _msgWnd, _sideMask, _inputMask, _maskBrush;
     static IntPtr _targetEx, _contentEx, _wallStyle, _wallEx, _wallParent;
+    struct StyleSnapshot { public IntPtr H; public long Ex; }
+    static readonly List<StyleSnapshot> _wallChildStyles = new List<StyleSnapshot>();
     static bool _targetExSaved, _contentExSaved, _wallSaved, _weLaunched;
     static RECT _lastRect;
     static bool _wallHidden, _restored = true;
     static volatile bool _stopping;
+    static int _restoreStarted;
     static Mode _mode = Mode.Composite;
     static Place _place = Place.ChildBottom;
     static bool _clientOnly = true, _keepWe, _verbose;
@@ -591,6 +594,13 @@ internal static class WeCodexBg
         _wallEx = GetWindowLongPtrW(_wall, GWL_EXSTYLE);
         _wallParent = GetAncestor(_wall, GA_PARENT);          // real parent, not the owner
         if (_wallParent == GetDesktopWindow()) _wallParent = IntPtr.Zero;
+        _wallChildStyles.Clear();
+        EnumChildWindows(_wall, (c, lp) =>
+        {
+            _wallChildStyles.Add(new StyleSnapshot { H = c, Ex = Style(c, GWL_EXSTYLE) });
+            return true;
+        }, IntPtr.Zero);
+        System.Threading.Interlocked.Exchange(ref _restoreStarted, 0);
         _wallSaved = true;
         _restored = false;
 
@@ -732,6 +742,7 @@ internal static class WeCodexBg
     static void RestoreAll()
     {
         if (_restored) return;
+        if (System.Threading.Interlocked.CompareExchange(ref _restoreStarted, 1, 0) != 0) return;
         _stopping = true;
         _restored = true;
 
@@ -749,6 +760,15 @@ internal static class WeCodexBg
             SetWindowLongPtrW(_target, GWL_EXSTYLE, _targetEx);
             ForceRepaint(_target);
         }
+        foreach (StyleSnapshot saved in _wallChildStyles)
+        {
+            if (IsWindow(saved.H))
+            {
+                SetStyle(saved.H, GWL_EXSTYLE, saved.Ex);
+                ForceRepaint(saved.H);
+            }
+        }
+        _wallChildStyles.Clear();
         if (_wallSaved && _wall != IntPtr.Zero && IsWindow(_wall))
         {
             SetWindowRgn(_wall, IntPtr.Zero, true);
@@ -773,6 +793,7 @@ internal static class WeCodexBg
         IntPtr t = FindTarget(o);
         if (t == IntPtr.Zero) { Log("[!] 未找到目标窗口（残留壁纸窗口已清理）。"); return; }
 
+        IntPtr content = o.Mode == Mode.Composite ? PickContentChild(t, o.ContentClass) : IntPtr.Zero;
         var all = new List<IntPtr>();
         all.Add(t);
         EnumChildWindows(t, (c, lp) => { all.Add(c); return true; }, IntPtr.Zero);   // snapshot first
@@ -798,7 +819,8 @@ internal static class WeCodexBg
                 ShowWindow(h, SW_SHOWNOACTIVATE);
                 fixedCount++;
             }
-            else if ((ex & WS_EX_LAYERED) != 0)
+            else if ((h == t || (h == content && content != IntPtr.Zero)) &&
+                     (ex & WS_EX_LAYERED) != 0)
             {
                 SetStyle(h, GWL_EXSTYLE, ex & ~WS_EX_LAYERED);
                 ForceRepaint(h);
@@ -840,9 +862,9 @@ Usage: we-codex-bg.exe [options]
 
 Modes
   --mode composite   embed the wallpaper as the bottom-most child window and fade
-                     only the content child window (frame stays opaque)  [default]
+                     only the content child window (frame stays opaque)
   --mode embed       embed only, no transparency (plumbing test)
-  --mode alpha       wallpaper pinned below the window + whole window translucent
+  --mode alpha       wallpaper pinned below the window + whole window translucent [default]
   --mode overlay     wallpaper pinned above the window as a click-through film;
                      the Codex window itself is never modified
   --alpha 0-255      host opacity for composite / alpha (default 235)
@@ -1169,14 +1191,18 @@ Geometry / misc
             switch (ev)
             {
                 case EVENT_OBJECT_DESTROY:
-                case EVENT_OBJECT_HIDE:
                     // in child placement the wallpaper dies with its parent: restore now
                     if (hwnd == _target && idObj == OBJID_WINDOW)
                     {
-                        LogV("[hook] target gone");
+                        LogV("[hook] target destroyed");
                         RestoreAll();
                         PostThreadMessageW(_mainThread, WM_QUIT, IntPtr.Zero, IntPtr.Zero);
                     }
+                    return;
+                case EVENT_OBJECT_HIDE:
+                    // Minimize also emits OBJECT_HIDE.  Sync hides the wallpaper and
+                    // keeps the helper alive so it can be shown again on restore.
+                    if (hwnd == _target && idObj == OBJID_WINDOW) Sync(false);
                     return;
                 case EVENT_OBJECT_LOCATIONCHANGE:
                     if (hwnd != _target || idObj != OBJID_WINDOW) return;
