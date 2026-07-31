@@ -17,6 +17,8 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Net;
+using System.Net.WebSockets;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -90,6 +92,9 @@ internal sealed class MainWindow : Window
     string _mode = "alpha";       // safe default: never touches the content child
     string _maskColor = "12161E";
     readonly List<WallpaperItem> _library = new List<WallpaperItem>();
+    readonly object _themeLock = new object();
+    bool _autoDarkThemeActive;
+    int _toneCheckVersion;
     bool _suppressListSelect;      // set while the list is rebuilt programmatically
     Process _proc;
     volatile bool _running;
@@ -587,6 +592,104 @@ internal sealed class MainWindow : Window
             UpdateCommandPreview();
             return;
         }
+    }
+
+    static bool IsDarkWallpaper(BitmapSource src)
+    {
+        if (src == null) return false;
+        try
+        {
+            var bgra = new FormatConvertedBitmap(src, PixelFormats.Bgra32, null, 0);
+            int stride = bgra.PixelWidth * 4;
+            var px = new byte[stride * bgra.PixelHeight];
+            bgra.CopyPixels(px, stride, 0);
+            var bins = new Dictionary<int, int>();
+            long lumaSum = 0;
+            int samples = 0, darkSamples = 0;
+            for (int y = 0; y < bgra.PixelHeight; y += 3)
+            for (int x = 0; x < bgra.PixelWidth; x += 3)
+            {
+                int p = y * stride + x * 4;
+                if (px[p + 3] < 128) continue;
+                int b = px[p], g = px[p + 1], r = px[p + 2];
+                int luma = (int)Math.Round(r * .2126 + g * .7152 + b * .0722);
+                int key = (r >> 4) << 8 | (g >> 4) << 4 | (b >> 4);
+                bins[key] = bins.ContainsKey(key) ? bins[key] + 1 : 1;
+                lumaSum += luma;
+                samples++;
+                if (luma < 190) darkSamples++;
+            }
+            if (samples == 0) return false;
+            int dominantKey = 0, dominantCount = 0;
+            foreach (var item in bins)
+                if (item.Value > dominantCount) { dominantKey = item.Key; dominantCount = item.Value; }
+            int dr = ((dominantKey >> 8) & 15) * 17 + 8;
+            int dg = ((dominantKey >> 4) & 15) * 17 + 8;
+            int db = (dominantKey & 15) * 17 + 8;
+            double dominantLuma = dr * .2126 + dg * .7152 + db * .0722;
+            double averageLuma = lumaSum / (double)samples;
+            double darkShare = darkSamples / (double)samples;
+            return dominantLuma < 188 || averageLuma < 172 || darkShare > .58;
+        }
+        catch { return false; }
+    }
+
+    static BitmapSource WallpaperPreview(string path)
+    {
+        try
+        {
+            if (Directory.Exists(path))
+            {
+                foreach (string name in new[] { "preview.jpg", "preview.png", "preview.gif" })
+                {
+                    string candidate = IOPath.Combine(path, name);
+                    if (File.Exists(candidate)) return LoadThumb(candidate) as BitmapSource;
+                }
+                return null;
+            }
+            if (!File.Exists(path)) return null;
+            string file = path;
+            if (string.Equals(IOPath.GetExtension(path), ".json", StringComparison.OrdinalIgnoreCase))
+            {
+                var top = JsonTopLevelStrings(File.ReadAllText(path, Encoding.UTF8));
+                string preview;
+                if (!top.TryGetValue("preview", out preview) || preview.Length == 0) return null;
+                file = IOPath.Combine(IOPath.GetDirectoryName(path), preview);
+            }
+            return File.Exists(file) ? LoadThumb(file) as BitmapSource : null;
+        }
+        catch { return null; }
+    }
+
+    void CheckWallpaperToneAsync(string path)
+    {
+        int version = Interlocked.Increment(ref _toneCheckVersion);
+        BitmapSource cached = null;
+        foreach (var w in _library)
+            if (string.Equals(w.ProjectPath, path, StringComparison.OrdinalIgnoreCase))
+            {
+                cached = w.Thumb as BitmapSource;
+                break;
+            }
+        var t = new Thread(() =>
+        {
+            BitmapSource preview = cached ?? WallpaperPreview(path);
+            if (!IsDarkWallpaper(preview)) return;
+            Dispatch(() =>
+            {
+                if (version != _toneCheckVersion) return;
+                try
+                {
+                    ApplyAutoDarkMode();
+                    AppendLog("[i] 已根据壁纸主色切换深色模式。", GreenC);
+                    MessageBox.Show(this, "深色模式在该壁纸中表现的通常更好", "壁纸主题提示",
+                                    MessageBoxButton.OK, MessageBoxImage.Information);
+                }
+                catch (Exception ex) { AppendLog("[!] 深色模式切换失败：" + ex.Message, RedC); }
+            });
+        }) { IsBackground = true };
+        t.SetApartmentState(ApartmentState.STA);
+        t.Start();
     }
 
     // -- minimal JSON reader: top-level string values only.  project.json is
@@ -1555,6 +1658,7 @@ internal sealed class MainWindow : Window
         SetRunningUi(true);
         SaveSettings();
         AppendLog("\u25B6 \u5DF2\u542F\u52A8  (" + _mode + ")", GreenC);
+        CheckWallpaperToneAsync(_wallpaper.Text.Trim());
     }
 
     void StopClicked()
@@ -1642,6 +1746,8 @@ internal sealed class MainWindow : Window
         AppendLog("\u25CF \u5DF2\u505C\u6B62  (\u9000\u51FA\u7801 " + code + ")", code == 0 ? Muted : RedC);
         try { if (_proc != null) _proc.Dispose(); } catch { }
         _proc = null;
+        if (_autoDarkThemeActive)
+            new Thread(RemoveAutoDarkMode) { IsBackground = true }.Start();
     }
 
     void RunRestore()
@@ -1672,6 +1778,109 @@ internal sealed class MainWindow : Window
             }
         }
         catch (Exception ex) { Dispatch(() => AppendLog("[!] 恢复失败：" + ex.Message, RedC)); }
+    }
+
+    void ApplyAutoDarkMode()
+    {
+        string css = @"
+:root {
+  color-scheme: dark !important;
+  --color-token-foreground: #f5f7ff !important;
+  --color-token-icon-foreground: #f5f7ff !important;
+  --color-token-description-foreground: rgba(238,242,255,.76) !important;
+  --color-token-input-foreground: #f7f9ff !important;
+  --color-token-input-placeholder-foreground: rgba(238,242,255,.62) !important;
+  --color-token-text-code-block-background: rgba(5,9,18,.76) !important;
+  --color-token-text-preformat-background: rgba(5,9,18,.82) !important;
+  --color-token-text-preformat-foreground: #f7f9ff !important;
+  --color-token-border-default: rgba(255,255,255,.18) !important;
+}
+html, body { background: #0f1116 !important; color: #f5f7ff !important; }
+.main-surface { background: rgba(7,11,20,.94) !important; }
+.app-shell-left-panel { background: rgba(5,9,18,.92) !important; }
+.composer-surface-chrome { background: rgba(20,24,34,.94) !important; color: #f7f9ff !important; }";
+        string expression = "(() => { let s=document.getElementById('we-codex-auto-dark');" +
+            "if(!s){s=document.createElement('style');s.id='we-codex-auto-dark';document.documentElement.appendChild(s);}" +
+            "s.textContent=\"" + JVal.Escape(css) + "\";return true;})()";
+        lock (_themeLock)
+        {
+            CdpEvaluate(expression);
+            _autoDarkThemeActive = true;
+        }
+    }
+
+    void RemoveAutoDarkMode()
+    {
+        lock (_themeLock)
+        {
+            if (!_autoDarkThemeActive) return;
+            try { CdpEvaluate("(() => { const s=document.getElementById('we-codex-auto-dark');if(s)s.remove();return true;})()"); }
+            catch { }
+            _autoDarkThemeActive = false;
+        }
+    }
+
+    static void CdpEvaluate(string expression)
+    {
+        string wsUrl = FindCodexWebSocket();
+        using (var ws = new ClientWebSocket())
+        using (var cancel = new CancellationTokenSource(4000))
+        {
+            ws.ConnectAsync(new Uri(wsUrl), cancel.Token).GetAwaiter().GetResult();
+            string request = "{\"id\":1,\"method\":\"Runtime.evaluate\",\"params\":{\"expression\":\"" +
+                             JVal.Escape(expression) + "\",\"returnByValue\":true}}";
+            byte[] send = Encoding.UTF8.GetBytes(request);
+            ws.SendAsync(new ArraySegment<byte>(send), WebSocketMessageType.Text, true, cancel.Token)
+              .GetAwaiter().GetResult();
+            var buffer = new byte[16384];
+            while (true)
+            {
+                using (var ms = new MemoryStream())
+                {
+                    WebSocketReceiveResult part;
+                    do
+                    {
+                        part = ws.ReceiveAsync(new ArraySegment<byte>(buffer), cancel.Token)
+                                 .GetAwaiter().GetResult();
+                        if (part.MessageType == WebSocketMessageType.Close)
+                            throw new Exception("CDP 连接已关闭");
+                        ms.Write(buffer, 0, part.Count);
+                    } while (!part.EndOfMessage);
+                    JVal msg = JVal.Parse(Encoding.UTF8.GetString(ms.ToArray()));
+                    if (msg["id"] == null || (int)msg["id"].AsNumber() != 1) continue;
+                    if (msg["error"] != null)
+                        throw new Exception(msg["error"]["message"].AsString("CDP 执行失败"));
+                    if (msg["result"] != null && msg["result"]["exceptionDetails"] != null)
+                        throw new Exception("Codex 样式注入失败");
+                    return;
+                }
+            }
+        }
+    }
+
+    static string FindCodexWebSocket()
+    {
+        foreach (int port in new[] { 9229, 9222 })
+        {
+            try
+            {
+                var req = (HttpWebRequest)WebRequest.Create("http://127.0.0.1:" + port + "/json/list");
+                req.Timeout = 1200;
+                string json;
+                using (var response = req.GetResponse())
+                using (var reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8))
+                    json = reader.ReadToEnd();
+                JVal list = JVal.Parse(json);
+                foreach (JVal target in list.Array)
+                {
+                    string url = target["url"] != null ? target["url"].AsString() : "";
+                    string ws = target["webSocketDebuggerUrl"] != null ? target["webSocketDebuggerUrl"].AsString() : "";
+                    if (url == "app://-/index.html" && ws.Length > 0) return ws;
+                }
+            }
+            catch { }
+        }
+        throw new Exception("未找到 Codex 调试目标");
     }
 
     // ------------------------------------------------------------- args build --
@@ -1876,6 +2085,7 @@ internal sealed class MainWindow : Window
             }
             catch { }
         }
+        RemoveAutoDarkMode();
     }
 
     // -------------------------------------------------------- widget factories --
