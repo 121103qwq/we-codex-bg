@@ -1664,6 +1664,7 @@ internal sealed class MainWindow : Window
     void StopClicked()
     {
         if (!_running || _stopping || _proc == null) return;
+        Interlocked.Increment(ref _toneCheckVersion);
         _stopping = true;
         _stopBtn.IsEnabled = false;
         SetStatus("\u505C\u6B62\u4E2D\u2026", YellowC);
@@ -2068,6 +2069,7 @@ html, body { background: #0f1116 !important; color: #f5f7ff !important; }
 
     void OnClosing(object sender, System.ComponentModel.CancelEventArgs e)
     {
+        Interlocked.Increment(ref _toneCheckVersion);
         SaveSettings();
         if (_running && _proc != null)
         {
