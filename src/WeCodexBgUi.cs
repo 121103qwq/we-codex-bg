@@ -17,8 +17,6 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
-using System.Net;
-using System.Net.WebSockets;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -75,9 +73,9 @@ internal sealed class MainWindow : Window
     TextBlock _propHint;
     Slider _volume;
     TextBlock _volumeVal;
-    Slider  _alpha, _film, _wallAlpha, _surfaceAlpha, _sideAlpha, _inputAlpha;
-    TextBlock _alphaVal, _filmVal, _wallAlphaVal, _surfaceAlphaVal, _sideAlphaVal, _inputAlphaVal, _maskColorText, _statusText, _cmdPreview;
-    Border  _alphaRow, _filmRow, _wallAlphaRow, _surfaceAlphaRow, _sideAlphaRow, _inputAlphaRow, _embedNote;
+    Slider  _alpha, _film, _wallAlpha, _sideAlpha, _inputAlpha;
+    TextBlock _alphaVal, _filmVal, _wallAlphaVal, _sideAlphaVal, _inputAlphaVal, _maskColorText, _statusText, _cmdPreview;
+    Border  _alphaRow, _filmRow, _wallAlphaRow, _sideAlphaRow, _inputAlphaRow, _embedNote;
     CheckBox _full, _keepWe, _noFallback;
     ComboBox _target;
     Button  _startBtn, _stopBtn, _restoreBtn;
@@ -95,9 +93,6 @@ internal sealed class MainWindow : Window
     Process _proc;
     volatile bool _running;
     volatile bool _stopping;
-    volatile bool _embedThemeActive;
-    readonly object _themeLock = new object();
-    DispatcherTimer _themeTimer;
 
     readonly string _appDir = AppDomain.CurrentDomain.BaseDirectory;
     string HelperPath { get { return IOPath.Combine(_appDir, "we-codex-bg.exe"); } }
@@ -1112,7 +1107,7 @@ internal sealed class MainWindow : Window
         sp.Children.Add(SectionHeader("模式", "动画与 Codex 窗口的合成方式"));
 
         var grid = new UniformGrid { Columns = 2, Margin = new Thickness(0, 10, 0, 0) };
-        grid.Children.Add(ModeCard("glass", "全域嵌入 · DEV", "壁纸原生嵌入；对话区和侧栏使用透明深色背景，文字保持高对比度。需要 Codex++。"));
+        grid.Children.Add(ModeCard("adaptive", "自适应 · Adaptive DEV", "壁纸位于下方；侧栏和输入区由独立遮罩提高不透明度，并按壁纸主色自动配色。"));
         grid.Children.Add(ModeCard("alpha", "透明 · Alpha", "钉在窗口正下方，整个窗口半透明。推荐默认，Codex 保持完全可操作。"));
         grid.Children.Add(ModeCard("overlay", "覆盖 · Overlay", "作为可穿透的半透明膜盖在界面上，完全不修改 Codex。最安全。"));
         grid.Children.Add(ModeCard("composite", "合成 · Composite ⚠", "只淡化页面内容、边框保持清晰，但对 Codex/ChatGPT 这类 Electron 宿主会导致界面完全失去鼠标响应，已自动拦截。"));
@@ -1159,12 +1154,10 @@ internal sealed class MainWindow : Window
         bool showAlpha = _mode == "composite" || _mode == "alpha" || _mode == "adaptive";
         bool showFilm = _mode == "overlay";
         bool adaptive = _mode == "adaptive";
-        bool glass = _mode == "glass";
         _alphaRow.Visibility = showAlpha ? Visibility.Visible : Visibility.Collapsed;
         _filmRow.Visibility = showFilm ? Visibility.Visible : Visibility.Collapsed;
         // the wallpaper is layered in every non-overlay mode, so it can always be dimmed
         _wallAlphaRow.Visibility = showFilm ? Visibility.Collapsed : Visibility.Visible;
-        _surfaceAlphaRow.Visibility = glass ? Visibility.Visible : Visibility.Collapsed;
         _sideAlphaRow.Visibility = adaptive ? Visibility.Visible : Visibility.Collapsed;
         _inputAlphaRow.Visibility = adaptive ? Visibility.Visible : Visibility.Collapsed;
         if (_maskColorText != null) _maskColorText.Visibility = adaptive ? Visibility.Visible : Visibility.Collapsed;
@@ -1200,16 +1193,6 @@ internal sealed class MainWindow : Window
             SendLiveAlpha(WM_SET_WALL_ALPHA, (int)_wallAlpha.Value);
         };
         sp.Children.Add(_wallAlphaRow);
-
-        _surfaceAlpha = MakeSlider(0, 255, 77);
-        _surfaceAlphaVal = ValueBadge("77");
-        _surfaceAlphaRow = SliderRow("对话区底色", "越低越透明；输入框和代码块仍保持清晰", _surfaceAlpha, _surfaceAlphaVal);
-        _surfaceAlpha.ValueChanged += (s, e) =>
-        {
-            _surfaceAlphaVal.Text = ((int)_surfaceAlpha.Value).ToString();
-            QueueEmbedThemeUpdate();
-        };
-        sp.Children.Add(_surfaceAlphaRow);
 
         _sideAlpha = MakeSlider(0, 255, 220);
         _sideAlphaVal = ValueBadge("220");
@@ -1544,20 +1527,6 @@ internal sealed class MainWindow : Window
             return;
         }
 
-        if (_mode == "glass")
-        {
-            try
-            {
-                ApplyEmbedTheme();
-                AppendLog("[i] 已应用 Codex++ 全域嵌入主题。", GreenC);
-            }
-            catch (Exception ex)
-            {
-                AppendLog("[!] 无法连接 Codex++（CDP 9229）：" + ex.Message, RedC);
-                return;
-            }
-        }
-
         var args = BuildArgs();
         var psi = new ProcessStartInfo(HelperPath, JoinArgs(args))
         {
@@ -1583,7 +1552,6 @@ internal sealed class MainWindow : Window
         catch (Exception ex)
         {
             AppendLog("[!] \u542F\u52A8\u5931\u8D25\uFF1A" + ex.Message, RedC);
-            if (_mode == "glass") TryRemoveEmbedTheme(false);
             _proc = null;
             return;
         }
@@ -1679,8 +1647,6 @@ internal sealed class MainWindow : Window
         AppendLog("\u25CF \u5DF2\u505C\u6B62  (\u9000\u51FA\u7801 " + code + ")", code == 0 ? Muted : RedC);
         try { if (_proc != null) _proc.Dispose(); } catch { }
         _proc = null;
-        if (_embedThemeActive)
-            new Thread(() => TryRemoveEmbedTheme(false)) { IsBackground = true }.Start();
     }
 
     void RunRestore()
@@ -1693,7 +1659,6 @@ internal sealed class MainWindow : Window
 
     void RunRestoreSilent()
     {
-        TryRemoveEmbedTheme(true);
         try
         {
             var psi = new ProcessStartInfo(HelperPath, "--restore")
@@ -1714,147 +1679,6 @@ internal sealed class MainWindow : Window
         catch (Exception ex) { Dispatch(() => AppendLog("[!] 恢复失败：" + ex.Message, RedC)); }
     }
 
-    void QueueEmbedThemeUpdate()
-    {
-        if (!_running || _mode != "glass") return;
-        if (_themeTimer == null)
-        {
-            _themeTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
-            _themeTimer.Tick += (s, e) =>
-            {
-                _themeTimer.Stop();
-                int alpha = (int)_surfaceAlpha.Value;
-                new Thread(() =>
-                {
-                    try { ApplyEmbedTheme(alpha); }
-                    catch (Exception ex) { Dispatch(() => AppendLog("[!] 主题更新失败：" + ex.Message, RedC)); }
-                }) { IsBackground = true }.Start();
-            };
-        }
-        _themeTimer.Stop();
-        _themeTimer.Start();
-    }
-
-    void ApplyEmbedTheme()
-    {
-        ApplyEmbedTheme((int)_surfaceAlpha.Value);
-    }
-
-    void ApplyEmbedTheme(int alpha)
-    {
-        double opacity = Math.Max(0, Math.Min(255, alpha)) / 255.0;
-        string a = opacity.ToString("0.###", CultureInfo.InvariantCulture);
-        string css = @"
-:root {
-  color-scheme: dark !important;
-  --color-token-foreground: #f5f7ff !important;
-  --color-token-icon-foreground: #f5f7ff !important;
-  --color-token-description-foreground: rgba(238,242,255,.76) !important;
-  --color-token-input-foreground: #f7f9ff !important;
-  --color-token-input-placeholder-foreground: rgba(238,242,255,.62) !important;
-  --color-token-text-code-block-background: rgba(5,9,18,.76) !important;
-  --color-token-text-preformat-background: rgba(5,9,18,.82) !important;
-  --color-token-text-preformat-foreground: #f7f9ff !important;
-  --color-token-border-default: rgba(255,255,255,.18) !important;
-}
-.main-surface {
-  background: linear-gradient(to bottom, rgba(7,11,20," + a + @") 0,
-    rgba(7,11,20," + a + @") calc(100% - 16px), transparent calc(100% - 16px)) !important;
-}
-.app-shell-left-panel { background: rgba(5,9,18,.24) !important; }
-.composer-surface-chrome {
-  background: rgba(20,24,34,.90) !important;
-  color: #f7f9ff !important;
-}";
-        string expression = "(() => { let s=document.getElementById('we-codex-embed-theme');" +
-            "if(!s){s=document.createElement('style');s.id='we-codex-embed-theme';document.documentElement.appendChild(s);}" +
-            "s.textContent=\"" + JVal.Escape(css) + "\";return true;})()";
-        lock (_themeLock)
-        {
-            CdpEvaluate(expression);
-            _embedThemeActive = true;
-        }
-    }
-
-    void TryRemoveEmbedTheme(bool force)
-    {
-        lock (_themeLock)
-        {
-            if (!force && !_embedThemeActive) return;
-            try
-            {
-                CdpEvaluate("(() => { const s=document.getElementById('we-codex-embed-theme');if(s)s.remove();return true;})()");
-            }
-            catch { }
-            _embedThemeActive = false;
-        }
-    }
-
-    static void CdpEvaluate(string expression)
-    {
-        string wsUrl = FindCodexWebSocket();
-        using (var ws = new ClientWebSocket())
-        using (var cancel = new CancellationTokenSource(4000))
-        {
-            ws.ConnectAsync(new Uri(wsUrl), cancel.Token).GetAwaiter().GetResult();
-            string request = "{\"id\":1,\"method\":\"Runtime.evaluate\",\"params\":{\"expression\":\"" +
-                             JVal.Escape(expression) + "\",\"returnByValue\":true}}";
-            byte[] send = Encoding.UTF8.GetBytes(request);
-            ws.SendAsync(new ArraySegment<byte>(send), WebSocketMessageType.Text, true, cancel.Token)
-              .GetAwaiter().GetResult();
-
-            var buffer = new byte[16384];
-            while (true)
-            {
-                using (var ms = new MemoryStream())
-                {
-                    WebSocketReceiveResult part;
-                    do
-                    {
-                        part = ws.ReceiveAsync(new ArraySegment<byte>(buffer), cancel.Token)
-                                 .GetAwaiter().GetResult();
-                        if (part.MessageType == WebSocketMessageType.Close)
-                            throw new Exception("CDP 连接已关闭");
-                        ms.Write(buffer, 0, part.Count);
-                    } while (!part.EndOfMessage);
-
-                    JVal msg = JVal.Parse(Encoding.UTF8.GetString(ms.ToArray()));
-                    if (msg["id"] == null || (int)msg["id"].AsNumber() != 1) continue;
-                    if (msg["error"] != null)
-                        throw new Exception(msg["error"]["message"].AsString("CDP 执行失败"));
-                    if (msg["result"] != null && msg["result"]["exceptionDetails"] != null)
-                        throw new Exception("Codex 样式注入失败");
-                    return;
-                }
-            }
-        }
-    }
-
-    static string FindCodexWebSocket()
-    {
-        foreach (int port in new[] { 9229, 9222 })
-        {
-            try
-            {
-                var req = (HttpWebRequest)WebRequest.Create("http://127.0.0.1:" + port + "/json/list");
-                req.Timeout = 1200;
-                string json;
-                using (var response = req.GetResponse())
-                using (var reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8))
-                    json = reader.ReadToEnd();
-                JVal list = JVal.Parse(json);
-                foreach (JVal target in list.Array)
-                {
-                    string url = target["url"] != null ? target["url"].AsString() : "";
-                    string ws = target["webSocketDebuggerUrl"] != null ? target["webSocketDebuggerUrl"].AsString() : "";
-                    if (url == "app://-/index.html" && ws.Length > 0) return ws;
-                }
-            }
-            catch { }
-        }
-        throw new Exception("未找到 app://-/index.html 调试目标");
-    }
-
     // ------------------------------------------------------------- args build --
 
     List<string> BuildArgs()
@@ -1863,7 +1687,7 @@ internal sealed class MainWindow : Window
         string wp = _wallpaper.Text.Trim();
         if (wp.Length > 0) { a.Add("--wallpaper"); a.Add(wp); }
 
-        a.Add("--mode"); a.Add(_mode == "glass" ? "embed" : _mode);
+        a.Add("--mode"); a.Add(_mode);
         if (_mode == "composite" || _mode == "alpha" || _mode == "adaptive") { a.Add("--alpha"); a.Add(((int)_alpha.Value).ToString()); }
         if (_mode == "overlay") { a.Add("--film"); a.Add(((int)_film.Value).ToString()); }
         else if ((int)_wallAlpha.Value != 255) { a.Add("--wall-alpha"); a.Add(((int)_wallAlpha.Value).ToString()); }
@@ -1986,7 +1810,6 @@ internal sealed class MainWindow : Window
             sb.AppendLine("alpha=" + (int)_alpha.Value);
             sb.AppendLine("film=" + (int)_film.Value);
             sb.AppendLine("wallAlpha=" + (int)_wallAlpha.Value);
-            sb.AppendLine("surfaceAlpha=" + (int)_surfaceAlpha.Value);
             sb.AppendLine("sideAlpha=" + (int)_sideAlpha.Value);
             sb.AppendLine("inputAlpha=" + (int)_inputAlpha.Value);
             sb.AppendLine("full=" + (_full.IsChecked == true));
@@ -2030,7 +1853,6 @@ internal sealed class MainWindow : Window
             if (map.TryGetValue("alpha", out v)) _alpha.Value = ParseInt(v, 235);
             if (map.TryGetValue("film", out v)) _film.Value = ParseInt(v, 70);
             if (map.TryGetValue("wallAlpha", out v)) _wallAlpha.Value = ParseInt(v, 255);
-            if (map.TryGetValue("surfaceAlpha", out v)) _surfaceAlpha.Value = ParseInt(v, 77);
             if (map.TryGetValue("sideAlpha", out v)) _sideAlpha.Value = ParseInt(v, 220);
             if (map.TryGetValue("inputAlpha", out v)) _inputAlpha.Value = ParseInt(v, 245);
             if (map.TryGetValue("full", out v)) _full.IsChecked = v == "True";
@@ -2043,7 +1865,6 @@ internal sealed class MainWindow : Window
     void OnClosing(object sender, System.ComponentModel.CancelEventArgs e)
     {
         SaveSettings();
-        TryRemoveEmbedTheme(true);
         if (_running && _proc != null)
         {
             // stop synchronously so we never leave the Codex window modified
