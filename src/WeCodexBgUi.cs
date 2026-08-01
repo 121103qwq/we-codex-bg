@@ -17,6 +17,8 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Net;
+using System.Net.WebSockets;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -62,6 +64,7 @@ internal sealed class MainWindow : Window
     static readonly Brush YellowC  = B("#E3B341");
 
     static readonly FontFamily Mono = new FontFamily("Cascadia Mono, Consolas, Menlo, monospace");
+    static readonly bool EnableWallpaperPropertyControl = false;
 
     // ---------------------------------------------------------------- controls --
 
@@ -69,13 +72,13 @@ internal sealed class MainWindow : Window
     TextBox _wpSearch;
     ListBox _wpList;
     TextBlock _wpCount;
-    StackPanel _propHost;              // dynamic wallpaper-property controls
-    TextBlock _propHint;
+    StackPanel _propHost = null;       // dynamic wallpaper-property controls disabled
+    TextBlock _propHint = null;
     Slider _volume;
     TextBlock _volumeVal;
-    Slider  _alpha, _film, _wallAlpha;
-    TextBlock _alphaVal, _filmVal, _wallAlphaVal, _statusText, _cmdPreview;
-    Border  _alphaRow, _filmRow, _wallAlphaRow, _embedNote;
+    Slider  _alpha, _film, _wallAlpha, _sideAlpha, _inputAlpha;
+    TextBlock _alphaVal, _filmVal, _wallAlphaVal, _sideAlphaVal, _inputAlphaVal, _maskColorText, _statusText, _cmdPreview;
+    Border  _alphaRow, _filmRow, _wallAlphaRow, _sideAlphaRow, _inputAlphaRow, _embedNote;
     CheckBox _full, _keepWe, _noFallback;
     ComboBox _target;
     Button  _startBtn, _stopBtn, _restoreBtn;
@@ -87,7 +90,12 @@ internal sealed class MainWindow : Window
     // ------------------------------------------------------------------ state --
 
     string _mode = "alpha";       // safe default: never touches the content child
+    string _maskColor = "12161E";
     readonly List<WallpaperItem> _library = new List<WallpaperItem>();
+    readonly object _themeLock = new object();
+    bool _autoDarkThemeActive;
+    int _autoDarkRunId;
+    int _toneCheckVersion;
     bool _suppressListSelect;      // set while the list is rebuilt programmatically
     Process _proc;
     volatile bool _running;
@@ -291,7 +299,13 @@ internal sealed class MainWindow : Window
             if (_suppressListSelect) return;
             var it = _wpList.SelectedItem as ListBoxItem;
             var w = it != null ? it.Tag as WallpaperItem : null;
-            if (w != null) { _wallpaper.Text = w.ProjectPath; UpdateCommandPreview(); }
+            if (w != null)
+            {
+                _maskColor = w.MaskColor;
+                if (_maskColorText != null) _maskColorText.Text = "#" + _maskColor;
+                _wallpaper.Text = w.ProjectPath;
+                UpdateCommandPreview();
+            }
         };
         sp.Children.Add(_wpList);
 
@@ -322,8 +336,10 @@ internal sealed class MainWindow : Window
         };
         _wallpaper.TextChanged += (s, e) =>
         {
+            UpdateMaskColorForPath(_wallpaper.Text.Trim());
             UpdateCommandPreview();
-            if (_propHost != null) LoadProperties(_wallpaper.Text.Trim());
+            if (EnableWallpaperPropertyControl && _propHost != null)
+                LoadProperties(_wallpaper.Text.Trim());
         };
         Grid.SetColumn(_wallpaper, 0);
         row.Children.Add(_wallpaper);
@@ -361,6 +377,7 @@ internal sealed class MainWindow : Window
     sealed class WallpaperItem
     {
         public string Title = "", ProjectPath = "", Type = "", WorkshopId = "", Tags = "";
+        public string MaskColor = "12161E";
         public ImageSource Thumb;
         public string Haystack = "";      // lower-cased title + id + tags, for matching
     }
@@ -383,6 +400,7 @@ internal sealed class MainWindow : Window
                 _library.Clear();
                 _library.AddRange(found);
                 RenderLibrary(_wpSearch.Text);
+                UpdateMaskColorForPath(_wallpaper.Text.Trim());
             });
         }) { IsBackground = true };
         t.SetApartmentState(ApartmentState.STA);   // BitmapImage wants STA
@@ -414,7 +432,11 @@ internal sealed class MainWindow : Window
             if (j.TryGetValue("preview", out v) && v.Length > 0)
             {
                 string img = IOPath.Combine(dir, v);
-                if (File.Exists(img)) w.Thumb = LoadThumb(img);
+                if (File.Exists(img))
+                {
+                    w.Thumb = LoadThumb(img);
+                    w.MaskColor = DominantMaskColor(w.Thumb as BitmapSource);
+                }
             }
             w.Haystack = (w.Title + " " + w.WorkshopId + " " + w.Tags).ToLowerInvariant();
             list.Add(w);
@@ -524,6 +546,151 @@ internal sealed class MainWindow : Window
             return bi;
         }
         catch { return null; }
+    }
+
+    static string DominantMaskColor(BitmapSource src)
+    {
+        if (src == null) return "12161E";
+        try
+        {
+            var bgra = new FormatConvertedBitmap(src, PixelFormats.Bgra32, null, 0);
+            int stride = bgra.PixelWidth * 4;
+            var px = new byte[stride * bgra.PixelHeight];
+            bgra.CopyPixels(px, stride, 0);
+            var bins = new Dictionary<int, int[]>();
+            for (int y = 0; y < bgra.PixelHeight; y += 2)
+            for (int x = 0; x < bgra.PixelWidth; x += 2)
+            {
+                int p = y * stride + x * 4;
+                if (px[p + 3] < 128) continue;
+                int b = px[p], g = px[p + 1], r = px[p + 2];
+                int key = (r >> 4) << 8 | (g >> 4) << 4 | (b >> 4);
+                int[] v;
+                if (!bins.TryGetValue(key, out v)) bins[key] = v = new int[4];
+                v[0] += r; v[1] += g; v[2] += b; v[3]++;
+            }
+            int[] best = null;
+            foreach (var v in bins.Values) if (best == null || v[3] > best[3]) best = v;
+            if (best == null || best[3] == 0) return "12161E";
+            double r0 = best[0] / (double)best[3], g0 = best[1] / (double)best[3], b0 = best[2] / (double)best[3];
+            double luma = r0 * .2126 + g0 * .7152 + b0 * .0722;
+            double f = luma > 1 ? Math.Min(.32, 28 / luma) : .25;
+            int r1 = Math.Max(8, Math.Min(62, (int)(r0 * f)));
+            int g1 = Math.Max(8, Math.Min(62, (int)(g0 * f)));
+            int b1 = Math.Max(8, Math.Min(62, (int)(b0 * f)));
+            return r1.ToString("X2") + g1.ToString("X2") + b1.ToString("X2");
+        }
+        catch { return "12161E"; }
+    }
+
+    void UpdateMaskColorForPath(string path)
+    {
+        foreach (var w in _library)
+        {
+            if (!string.Equals(w.ProjectPath, path, StringComparison.OrdinalIgnoreCase)) continue;
+            _maskColor = w.MaskColor;
+            if (_maskColorText != null) _maskColorText.Text = "自动遮罩色  #" + _maskColor;
+            UpdateCommandPreview();
+            return;
+        }
+    }
+
+    static bool IsDarkWallpaper(BitmapSource src)
+    {
+        if (src == null) return false;
+        try
+        {
+            var bgra = new FormatConvertedBitmap(src, PixelFormats.Bgra32, null, 0);
+            int stride = bgra.PixelWidth * 4;
+            var px = new byte[stride * bgra.PixelHeight];
+            bgra.CopyPixels(px, stride, 0);
+            var bins = new Dictionary<int, int>();
+            long lumaSum = 0;
+            int samples = 0, darkSamples = 0;
+            for (int y = 0; y < bgra.PixelHeight; y += 3)
+            for (int x = 0; x < bgra.PixelWidth; x += 3)
+            {
+                int p = y * stride + x * 4;
+                if (px[p + 3] < 128) continue;
+                int b = px[p], g = px[p + 1], r = px[p + 2];
+                int luma = (int)Math.Round(r * .2126 + g * .7152 + b * .0722);
+                int key = (r >> 4) << 8 | (g >> 4) << 4 | (b >> 4);
+                bins[key] = bins.ContainsKey(key) ? bins[key] + 1 : 1;
+                lumaSum += luma;
+                samples++;
+                if (luma < 190) darkSamples++;
+            }
+            if (samples == 0) return false;
+            int dominantKey = 0, dominantCount = 0;
+            foreach (var item in bins)
+                if (item.Value > dominantCount) { dominantKey = item.Key; dominantCount = item.Value; }
+            int dr = ((dominantKey >> 8) & 15) * 17 + 8;
+            int dg = ((dominantKey >> 4) & 15) * 17 + 8;
+            int db = (dominantKey & 15) * 17 + 8;
+            double dominantLuma = dr * .2126 + dg * .7152 + db * .0722;
+            double averageLuma = lumaSum / (double)samples;
+            double darkShare = darkSamples / (double)samples;
+            return dominantLuma < 188 || averageLuma < 172 || darkShare > .58;
+        }
+        catch { return false; }
+    }
+
+    static BitmapSource WallpaperPreview(string path)
+    {
+        try
+        {
+            if (Directory.Exists(path))
+            {
+                foreach (string name in new[] { "preview.jpg", "preview.png", "preview.gif" })
+                {
+                    string candidate = IOPath.Combine(path, name);
+                    if (File.Exists(candidate)) return LoadThumb(candidate) as BitmapSource;
+                }
+                return null;
+            }
+            if (!File.Exists(path)) return null;
+            string file = path;
+            if (string.Equals(IOPath.GetExtension(path), ".json", StringComparison.OrdinalIgnoreCase))
+            {
+                var top = JsonTopLevelStrings(File.ReadAllText(path, Encoding.UTF8));
+                string preview;
+                if (!top.TryGetValue("preview", out preview) || preview.Length == 0) return null;
+                file = IOPath.Combine(IOPath.GetDirectoryName(path), preview);
+            }
+            return File.Exists(file) ? LoadThumb(file) as BitmapSource : null;
+        }
+        catch { return null; }
+    }
+
+    void CheckWallpaperToneAsync(string path)
+    {
+        int version = Interlocked.Increment(ref _toneCheckVersion);
+        BitmapSource cached = null;
+        foreach (var w in _library)
+            if (string.Equals(w.ProjectPath, path, StringComparison.OrdinalIgnoreCase))
+            {
+                cached = w.Thumb as BitmapSource;
+                break;
+            }
+        var t = new Thread(() =>
+        {
+            BitmapSource preview = cached ?? WallpaperPreview(path);
+            if (!IsDarkWallpaper(preview)) return;
+            Dispatch(() =>
+            {
+                if (version != _toneCheckVersion || !_running) return;
+                try
+                {
+                    ApplyAutoDarkMode(version);
+                    AppendLog("[i] 已根据壁纸主色切换深色模式。", GreenC);
+                    MessageBox.Show(this, "深色模式在该壁纸中表现的通常更好", "壁纸主题提示",
+                                    MessageBoxButton.OK, MessageBoxImage.Information);
+                }
+                catch (Exception ex) { AppendLog("[!] 深色模式切换失败：" + ex.Message, RedC); }
+            });
+        }) { IsBackground = true };
+        t.SetApartmentState(ApartmentState.STA);
+        t.Start();
     }
 
     // -- minimal JSON reader: top-level string values only.  project.json is
@@ -709,7 +876,7 @@ internal sealed class MainWindow : Window
     {
         var card = Card();
         var sp = (StackPanel)card.Child;
-        sp.Children.Add(SectionHeader("控制", "播放与壁纸自身的参数，实时生效"));
+        sp.Children.Add(SectionHeader("控制", "播放控制"));
 
         // -- transport row --
         var row = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 10, 0, 0) };
@@ -727,15 +894,6 @@ internal sealed class MainWindow : Window
         _volume.PreviewMouseUp += (s, e) => ApplyWallpaperVolume();
         sp.Children.Add(SliderRow("壁纸音量", "拖动结束后应用（仅 Wallpaper Engine）", _volume, _volumeVal));
 
-        // -- dynamic wallpaper properties --
-        _propHint = new TextBlock
-        {
-            Text = "选择一张壁纸后，这里会列出它自己的可调参数。", Foreground = Faint,
-            FontSize = 11, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 12, 0, 0)
-        };
-        sp.Children.Add(_propHint);
-        _propHost = new StackPanel { Margin = new Thickness(0, 4, 0, 0) };
-        sp.Children.Add(_propHost);
         return card;
     }
 
@@ -827,6 +985,7 @@ internal sealed class MainWindow : Window
 
     void LoadProperties(string projectJsonPath)
     {
+        if (!EnableWallpaperPropertyControl) return;
         _props.Clear();
         _propHost.Children.Clear();
 
@@ -1036,6 +1195,7 @@ internal sealed class MainWindow : Window
     // wallpaper64.exe -control applyProperties -properties RAW~({"name":{"value":X}})~
     void ApplyProperty(string name, string value)
     {
+        if (!EnableWallpaperPropertyControl) return;
         bool numeric;
         double d;
         numeric = double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out d);
@@ -1059,6 +1219,7 @@ internal sealed class MainWindow : Window
         sp.Children.Add(SectionHeader("模式", "动画与 Codex 窗口的合成方式"));
 
         var grid = new UniformGrid { Columns = 2, Margin = new Thickness(0, 10, 0, 0) };
+        grid.Children.Add(ModeCard("adaptive", "自适应 · Adaptive DEV", "壁纸位于下方；侧栏和输入区由独立遮罩提高不透明度，并按壁纸主色自动配色。"));
         grid.Children.Add(ModeCard("alpha", "透明 · Alpha", "钉在窗口正下方，整个窗口半透明。推荐默认，Codex 保持完全可操作。"));
         grid.Children.Add(ModeCard("overlay", "覆盖 · Overlay", "作为可穿透的半透明膜盖在界面上，完全不修改 Codex。最安全。"));
         grid.Children.Add(ModeCard("composite", "合成 · Composite ⚠", "只淡化页面内容、边框保持清晰，但对 Codex/ChatGPT 这类 Electron 宿主会导致界面完全失去鼠标响应，已自动拦截。"));
@@ -1102,12 +1263,16 @@ internal sealed class MainWindow : Window
             c.BorderThickness = new Thickness(sel ? 1.6 : 1);
             c.Background = sel ? B("#1B2436") : Panel2;
         }
-        bool showAlpha = _mode == "composite" || _mode == "alpha";
+        bool showAlpha = _mode == "composite" || _mode == "alpha" || _mode == "adaptive";
         bool showFilm = _mode == "overlay";
+        bool adaptive = _mode == "adaptive";
         _alphaRow.Visibility = showAlpha ? Visibility.Visible : Visibility.Collapsed;
         _filmRow.Visibility = showFilm ? Visibility.Visible : Visibility.Collapsed;
         // the wallpaper is layered in every non-overlay mode, so it can always be dimmed
         _wallAlphaRow.Visibility = showFilm ? Visibility.Collapsed : Visibility.Visible;
+        _sideAlphaRow.Visibility = adaptive ? Visibility.Visible : Visibility.Collapsed;
+        _inputAlphaRow.Visibility = adaptive ? Visibility.Visible : Visibility.Collapsed;
+        if (_maskColorText != null) _maskColorText.Visibility = adaptive ? Visibility.Visible : Visibility.Collapsed;
         _embedNote.Visibility = _mode == "embed" ? Visibility.Visible : Visibility.Collapsed;
     }
 
@@ -1140,6 +1305,35 @@ internal sealed class MainWindow : Window
             SendLiveAlpha(WM_SET_WALL_ALPHA, (int)_wallAlpha.Value);
         };
         sp.Children.Add(_wallAlphaRow);
+
+        _sideAlpha = MakeSlider(0, 255, 220);
+        _sideAlphaVal = ValueBadge("220");
+        _sideAlphaRow = SliderRow("侧边栏遮罩", "越高 = 侧栏越接近不透明", _sideAlpha, _sideAlphaVal);
+        _sideAlpha.ValueChanged += (s, e) =>
+        {
+            _sideAlphaVal.Text = ((int)_sideAlpha.Value).ToString();
+            UpdateCommandPreview();
+            SendLiveAlpha(WM_SET_SIDE_ALPHA, (int)_sideAlpha.Value);
+        };
+        sp.Children.Add(_sideAlphaRow);
+
+        _inputAlpha = MakeSlider(0, 255, 245);
+        _inputAlphaVal = ValueBadge("245");
+        _inputAlphaRow = SliderRow("输入区遮罩", "越高 = 输入框区域越少显示壁纸", _inputAlpha, _inputAlphaVal);
+        _inputAlpha.ValueChanged += (s, e) =>
+        {
+            _inputAlphaVal.Text = ((int)_inputAlpha.Value).ToString();
+            UpdateCommandPreview();
+            SendLiveAlpha(WM_SET_INPUT_ALPHA, (int)_inputAlpha.Value);
+        };
+        sp.Children.Add(_inputAlphaRow);
+
+        _maskColorText = new TextBlock
+        {
+            Text = "#" + _maskColor, Foreground = Muted, FontFamily = Mono,
+            FontSize = 11, Margin = new Thickness(2, 6, 0, 0)
+        };
+        sp.Children.Add(_maskColorText);
 
         _film = MakeSlider(0, 255, 70);
         _filmVal = ValueBadge("70");
@@ -1478,24 +1672,27 @@ internal sealed class MainWindow : Window
         SetRunningUi(true);
         SaveSettings();
         AppendLog("\u25B6 \u5DF2\u542F\u52A8  (" + _mode + ")", GreenC);
+        CheckWallpaperToneAsync(_wallpaper.Text.Trim());
     }
 
     void StopClicked()
     {
         if (!_running || _stopping || _proc == null) return;
+        Interlocked.Increment(ref _toneCheckVersion);
         _stopping = true;
         _stopBtn.IsEnabled = false;
         SetStatus("\u505C\u6B62\u4E2D\u2026", YellowC);
         AppendLog("\u25A0 \u6B63\u5728\u505C\u6B62\u2026", YellowC);
 
         var proc = _proc;
-        var t = new Thread(() => GracefulStop(proc, 5000)) { IsBackground = true };
+        var restoreArgs = BuildRestoreArgs();
+        var t = new Thread(() => GracefulStop(proc, 5000, restoreArgs)) { IsBackground = true };
         t.Start();
     }
 
     // Post WM_CLOSE to the helper's message-only window so it runs RestoreAll();
     // if it doesn't exit in time, kill it and run --restore to clean up.
-    void GracefulStop(Process proc, int timeoutMs)
+    void GracefulStop(Process proc, int timeoutMs, List<string> restoreArgs)
     {
         try
         {
@@ -1507,7 +1704,7 @@ internal sealed class MainWindow : Window
                 Dispatch(() => AppendLog("[!] 未正常退出 —— 强制结束并执行 --restore", YellowC));
                 try { proc.Kill(); } catch { }
                 try { proc.WaitForExit(2000); } catch { }
-                RunRestoreSilent();
+                RunRestoreSilent(restoreArgs);
             }
         }
         catch (Exception ex) { Dispatch(() => AppendLog("[!] 停止出错：" + ex.Message, RedC)); }
@@ -1518,6 +1715,8 @@ internal sealed class MainWindow : Window
     // you are eyeballing contrast against a moving wallpaper.
     const uint WM_SET_HOST_ALPHA = 0x8000 + 1;
     const uint WM_SET_WALL_ALPHA = 0x8000 + 2;
+    const uint WM_SET_SIDE_ALPHA = 0x8000 + 3;
+    const uint WM_SET_INPUT_ALPHA = 0x8000 + 4;
 
     void SendLiveAlpha(uint msg, int value)
     {
@@ -1563,21 +1762,26 @@ internal sealed class MainWindow : Window
         AppendLog("\u25CF \u5DF2\u505C\u6B62  (\u9000\u51FA\u7801 " + code + ")", code == 0 ? Muted : RedC);
         try { if (_proc != null) _proc.Dispose(); } catch { }
         _proc = null;
+        int darkRunId;
+        lock (_themeLock) { darkRunId = _autoDarkRunId; }
+        if (darkRunId != 0)
+            new Thread(() => RemoveAutoDarkMode(darkRunId)) { IsBackground = true }.Start();
     }
 
     void RunRestore()
     {
         if (!File.Exists(HelperPath)) { AppendLog("[!] \u627E\u4E0D\u5230\u8F85\u52A9\u7A0B\u5E8F exe\u3002", RedC); return; }
         AppendLog("\u21BA \u6B63\u5728\u6267\u884C --restore\u2026", YellowC);
-        var t = new Thread(RunRestoreSilent) { IsBackground = true };
+        var restoreArgs = BuildRestoreArgs();
+        var t = new Thread(() => RunRestoreSilent(restoreArgs)) { IsBackground = true };
         t.Start();
     }
 
-    void RunRestoreSilent()
+    void RunRestoreSilent(List<string> args)
     {
         try
         {
-            var psi = new ProcessStartInfo(HelperPath, "--restore")
+            var psi = new ProcessStartInfo(HelperPath, JoinArgs(args))
             {
                 UseShellExecute = false, CreateNoWindow = true,
                 RedirectStandardOutput = true, RedirectStandardError = true,
@@ -1595,7 +1799,126 @@ internal sealed class MainWindow : Window
         catch (Exception ex) { Dispatch(() => AppendLog("[!] 恢复失败：" + ex.Message, RedC)); }
     }
 
+    void ApplyAutoDarkMode(int runId)
+    {
+        string css = @"
+:root {
+  color-scheme: dark !important;
+  --color-token-foreground: #f5f7ff !important;
+  --color-token-icon-foreground: #f5f7ff !important;
+  --color-token-description-foreground: rgba(238,242,255,.76) !important;
+  --color-token-input-foreground: #f7f9ff !important;
+  --color-token-input-placeholder-foreground: rgba(238,242,255,.62) !important;
+  --color-token-text-code-block-background: rgba(5,9,18,.76) !important;
+  --color-token-text-preformat-background: rgba(5,9,18,.82) !important;
+  --color-token-text-preformat-foreground: #f7f9ff !important;
+  --color-token-border-default: rgba(255,255,255,.18) !important;
+}
+html, body { background: #0f1116 !important; color: #f5f7ff !important; }
+.main-surface { background: rgba(7,11,20,.94) !important; }
+.app-shell-left-panel { background: rgba(5,9,18,.92) !important; }
+.composer-surface-chrome { background: rgba(20,24,34,.94) !important; color: #f7f9ff !important; }";
+        string expression = "(() => { let s=document.getElementById('we-codex-auto-dark');" +
+            "if(!s){s=document.createElement('style');s.id='we-codex-auto-dark';document.documentElement.appendChild(s);}" +
+            "s.textContent=\"" + JVal.Escape(css) + "\";return true;})()";
+        lock (_themeLock)
+        {
+            CdpEvaluate(expression);
+            _autoDarkThemeActive = true;
+            _autoDarkRunId = runId;
+        }
+    }
+
+    void RemoveAutoDarkMode(int runId)
+    {
+        lock (_themeLock)
+        {
+            if (!_autoDarkThemeActive || _autoDarkRunId != runId) return;
+            try { CdpEvaluate("(() => { const s=document.getElementById('we-codex-auto-dark');if(s)s.remove();return true;})()"); }
+            catch { }
+            _autoDarkThemeActive = false;
+            _autoDarkRunId = 0;
+        }
+    }
+
+    static void CdpEvaluate(string expression)
+    {
+        string wsUrl = FindCodexWebSocket();
+        using (var ws = new ClientWebSocket())
+        using (var cancel = new CancellationTokenSource(4000))
+        {
+            ws.ConnectAsync(new Uri(wsUrl), cancel.Token).GetAwaiter().GetResult();
+            string request = "{\"id\":1,\"method\":\"Runtime.evaluate\",\"params\":{\"expression\":\"" +
+                             JVal.Escape(expression) + "\",\"returnByValue\":true}}";
+            byte[] send = Encoding.UTF8.GetBytes(request);
+            ws.SendAsync(new ArraySegment<byte>(send), WebSocketMessageType.Text, true, cancel.Token)
+              .GetAwaiter().GetResult();
+            var buffer = new byte[16384];
+            while (true)
+            {
+                using (var ms = new MemoryStream())
+                {
+                    WebSocketReceiveResult part;
+                    do
+                    {
+                        part = ws.ReceiveAsync(new ArraySegment<byte>(buffer), cancel.Token)
+                                 .GetAwaiter().GetResult();
+                        if (part.MessageType == WebSocketMessageType.Close)
+                            throw new Exception("CDP 连接已关闭");
+                        ms.Write(buffer, 0, part.Count);
+                    } while (!part.EndOfMessage);
+                    JVal msg = JVal.Parse(Encoding.UTF8.GetString(ms.ToArray()));
+                    if (msg["id"] == null || (int)msg["id"].AsNumber() != 1) continue;
+                    if (msg["error"] != null)
+                        throw new Exception(msg["error"]["message"].AsString("CDP 执行失败"));
+                    if (msg["result"] != null && msg["result"]["exceptionDetails"] != null)
+                        throw new Exception("Codex 样式注入失败");
+                    return;
+                }
+            }
+        }
+    }
+
+    static string FindCodexWebSocket()
+    {
+        foreach (int port in new[] { 9229, 9222 })
+        {
+            try
+            {
+                var req = (HttpWebRequest)WebRequest.Create("http://127.0.0.1:" + port + "/json/list");
+                req.Timeout = 1200;
+                string json;
+                using (var response = req.GetResponse())
+                using (var reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8))
+                    json = reader.ReadToEnd();
+                JVal list = JVal.Parse(json);
+                foreach (JVal target in list.Array)
+                {
+                    string url = target["url"] != null ? target["url"].AsString() : "";
+                    string ws = target["webSocketDebuggerUrl"] != null ? target["webSocketDebuggerUrl"].AsString() : "";
+                    if (url == "app://-/index.html" && ws.Length > 0) return ws;
+                }
+            }
+            catch { }
+        }
+        throw new Exception("未找到 Codex 调试目标");
+    }
+
     // ------------------------------------------------------------- args build --
+
+    List<string> BuildRestoreArgs()
+    {
+        var a = new List<string> { "--restore" };
+        var sel = _target != null ? _target.SelectedItem as WinItem : null;
+        if (sel != null && sel.Pid != 0) { a.Add("--pid"); a.Add(sel.Pid.ToString()); }
+
+        string ww = _weWindow.Text.Trim();
+        if (ww.Length > 0) { a.Add("--we-window"); a.Add(ww); }
+        string cc = _contentClass.Text.Trim();
+        if (cc.Length > 0) { a.Add("--content-class"); a.Add(cc); }
+        if (_mode.Length > 0) { a.Add("--mode"); a.Add(_mode); }
+        return a;
+    }
 
     List<string> BuildArgs()
     {
@@ -1604,9 +1927,15 @@ internal sealed class MainWindow : Window
         if (wp.Length > 0) { a.Add("--wallpaper"); a.Add(wp); }
 
         a.Add("--mode"); a.Add(_mode);
-        if (_mode == "composite" || _mode == "alpha") { a.Add("--alpha"); a.Add(((int)_alpha.Value).ToString()); }
+        if (_mode == "composite" || _mode == "alpha" || _mode == "adaptive") { a.Add("--alpha"); a.Add(((int)_alpha.Value).ToString()); }
         if (_mode == "overlay") { a.Add("--film"); a.Add(((int)_film.Value).ToString()); }
         else if ((int)_wallAlpha.Value != 255) { a.Add("--wall-alpha"); a.Add(((int)_wallAlpha.Value).ToString()); }
+        if (_mode == "adaptive")
+        {
+            a.Add("--side-alpha"); a.Add(((int)_sideAlpha.Value).ToString());
+            a.Add("--input-alpha"); a.Add(((int)_inputAlpha.Value).ToString());
+            a.Add("--mask-color"); a.Add(_maskColor);
+        }
 
         string we = _we.Text.Trim();
         if (we.Length > 0) { a.Add("--we"); a.Add(we); }
@@ -1715,11 +2044,13 @@ internal sealed class MainWindow : Window
             sb.AppendLine("contentClass=" + _contentClass.Text);
             sb.AppendLine("round=" + _round.Text);
             sb.AppendLine("fps=" + _fps.Text);
-            sb.AppendLine("cfgver=3");
+            sb.AppendLine("cfgver=4");
             sb.AppendLine("mode=" + _mode);
             sb.AppendLine("alpha=" + (int)_alpha.Value);
             sb.AppendLine("film=" + (int)_film.Value);
             sb.AppendLine("wallAlpha=" + (int)_wallAlpha.Value);
+            sb.AppendLine("sideAlpha=" + (int)_sideAlpha.Value);
+            sb.AppendLine("inputAlpha=" + (int)_inputAlpha.Value);
             sb.AppendLine("full=" + (_full.IsChecked == true));
             sb.AppendLine("keepWe=" + (_keepWe.IsChecked == true));
             sb.AppendLine("noFallback=" + (_noFallback.IsChecked == true));
@@ -1757,10 +2088,12 @@ internal sealed class MainWindow : Window
             if (cfgver < 2 && _mode == "composite") _mode = "alpha";
             // cfgver 3: the old 205 host opacity washes the UI out under a bright
             // wallpaper.  Nudge anyone still on it up to the readable default.
-            if (cfgver < 3 && (int)_alpha.Value <= 205) _alpha.Value = 235;
             if (map.TryGetValue("alpha", out v)) _alpha.Value = ParseInt(v, 235);
+            if (cfgver < 3 && (int)_alpha.Value <= 205) _alpha.Value = 235;
             if (map.TryGetValue("film", out v)) _film.Value = ParseInt(v, 70);
             if (map.TryGetValue("wallAlpha", out v)) _wallAlpha.Value = ParseInt(v, 255);
+            if (map.TryGetValue("sideAlpha", out v)) _sideAlpha.Value = ParseInt(v, 220);
+            if (map.TryGetValue("inputAlpha", out v)) _inputAlpha.Value = ParseInt(v, 245);
             if (map.TryGetValue("full", out v)) _full.IsChecked = v == "True";
             if (map.TryGetValue("keepWe", out v)) _keepWe.IsChecked = v == "True";
             if (map.TryGetValue("noFallback", out v)) _noFallback.IsChecked = v == "True";
@@ -1770,6 +2103,7 @@ internal sealed class MainWindow : Window
 
     void OnClosing(object sender, System.ComponentModel.CancelEventArgs e)
     {
+        Interlocked.Increment(ref _toneCheckVersion);
         SaveSettings();
         if (_running && _proc != null)
         {
@@ -1777,16 +2111,20 @@ internal sealed class MainWindow : Window
             try
             {
                 var proc = _proc;
+                var restoreArgs = BuildRestoreArgs();
                 IntPtr msg = FindHelperMsgWindow(proc.Id);
                 if (msg != IntPtr.Zero) Native.PostMessage(msg, 0x0010, IntPtr.Zero, IntPtr.Zero);
                 if (!proc.WaitForExit(4000))
                 {
                     try { proc.Kill(); } catch { }
-                    RunRestoreSilent();
+                    RunRestoreSilent(restoreArgs);
                 }
             }
             catch { }
         }
+        int darkRunId;
+        lock (_themeLock) { darkRunId = _autoDarkRunId; }
+        if (darkRunId != 0) RemoveAutoDarkMode(darkRunId);
     }
 
     // -------------------------------------------------------- widget factories --
