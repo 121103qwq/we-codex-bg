@@ -10,7 +10,12 @@ setlocal
 set "ROOT=%~dp0"
 set "OUT=%ROOT%bin"
 set "EXE=%OUT%\we-codex-bg-ui.exe"
+set "ICON=%ROOT%assets\we-codex-bg.ico"
 if not exist "%OUT%" mkdir "%OUT%"
+if not exist "%ICON%" (
+  echo [build-ui] missing application icon: %ICON%
+  exit /b 1
+)
 
 set "FW=%WINDIR%\Microsoft.NET\Framework64\v4.0.30319"
 if not exist "%FW%\csc.exe" set "FW=%WINDIR%\Microsoft.NET\Framework\v4.0.30319"
@@ -30,7 +35,7 @@ for %%D in ("%WPF%\WindowsBase.dll" "%WPF%\PresentationCore.dll" "%WPF%\Presenta
 )
 
 echo [build-ui] %CSC%
-"%CSC%" /nologo /optimize+ /platform:x64 /target:winexe /out:"%EXE%" ^
+"%CSC%" /nologo /optimize+ /platform:x64 /target:winexe /win32icon:"%ICON%" /out:"%EXE%" ^
   /reference:"%WPF%\WindowsBase.dll" ^
   /reference:"%WPF%\PresentationCore.dll" ^
   /reference:"%WPF%\PresentationFramework.dll" ^

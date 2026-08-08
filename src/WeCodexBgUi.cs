@@ -26,6 +26,7 @@ using System.Windows.Controls.Primitives;
 using System.Windows.Data;
 using System.Windows.Documents;
 using System.Windows.Input;
+using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Shapes;
@@ -84,6 +85,7 @@ internal sealed class MainWindow : Window
     Paragraph _logPara;
     Ellipse _statusDot;
     System.Windows.Forms.NotifyIcon _tray;
+    System.Drawing.Icon _appIcon;
     readonly List<Border> _modeCards = new List<Border>();
 
     // ------------------------------------------------------------------ state --
@@ -117,6 +119,7 @@ internal sealed class MainWindow : Window
         FontSize = 13;
         SnapsToDevicePixels = true;
         TextOptions.SetTextFormattingMode(this, TextFormattingMode.Ideal);
+        ApplyAppIcon();
 
         var chrome = new WindowChrome
         {
@@ -1952,7 +1955,7 @@ internal sealed class MainWindow : Window
     {
         _tray = new System.Windows.Forms.NotifyIcon
         {
-            Icon = System.Drawing.SystemIcons.Application,
+            Icon = _appIcon ?? System.Drawing.SystemIcons.Application,
             Text = "WE · Codex 背景",
             Visible = true
         };
@@ -1965,6 +1968,22 @@ internal sealed class MainWindow : Window
         menu.Items.Add(exit);
         _tray.ContextMenuStrip = menu;
         _tray.DoubleClick += (s, e) => RestoreFromTray();
+    }
+
+    void ApplyAppIcon()
+    {
+        try
+        {
+            using (var process = Process.GetCurrentProcess())
+                _appIcon = System.Drawing.Icon.ExtractAssociatedIcon(process.MainModule.FileName);
+            if (_appIcon == null) _appIcon = System.Drawing.SystemIcons.Application;
+            Icon = Imaging.CreateBitmapSourceFromHIcon(_appIcon.Handle, Int32Rect.Empty,
+                                                        BitmapSizeOptions.FromEmptyOptions());
+        }
+        catch
+        {
+            _appIcon = System.Drawing.SystemIcons.Application;
+        }
     }
 
     void HideToTray()

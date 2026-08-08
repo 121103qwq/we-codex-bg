@@ -9,6 +9,12 @@ setlocal
 set "ROOT=%~dp0"
 set "BIN=%ROOT%bin"
 set "DIST=%ROOT%dist"
+set "ICON=%ROOT%assets\we-codex-bg.ico"
+
+if not exist "%ICON%" (
+  echo [setup] missing application icon: %ICON%
+  exit /b 1
+)
 
 call "%ROOT%build.bat" || exit /b 1
 call "%ROOT%build-ui.bat" || exit /b 1
@@ -28,7 +34,7 @@ set "CSC=%FW%\csc.exe"
 set "WPF=%FW%\WPF"
 
 echo [setup] compiling installer
-"%CSC%" /nologo /optimize+ /platform:x64 /target:winexe /out:"%DIST%\we-codex-bg-setup.exe" ^
+"%CSC%" /nologo /optimize+ /platform:x64 /target:winexe /win32icon:"%ICON%" /out:"%DIST%\we-codex-bg-setup.exe" ^
   /reference:"%WPF%\WindowsBase.dll" ^
   /reference:"%WPF%\PresentationCore.dll" ^
   /reference:"%WPF%\PresentationFramework.dll" ^
