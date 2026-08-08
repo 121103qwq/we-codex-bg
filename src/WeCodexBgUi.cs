@@ -23,6 +23,7 @@ using System.Threading;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
+using System.Windows.Data;
 using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Media;
@@ -1210,7 +1211,7 @@ internal sealed class MainWindow : Window
     {
         var card = Card();
         var sp = (StackPanel)card.Child;
-        sp.Children.Add(SectionHeader("目标窗口", "让壁纸位于哪个窗口背后"));
+        sp.Children.Add(SectionHeader("目标窗口", "默认 Codex；也可选择当前可见的 Steam、QQ、浏览器等应用"));
 
         var row = new Grid { Margin = new Thickness(0, 10, 0, 0) };
         row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -1220,7 +1221,9 @@ internal sealed class MainWindow : Window
         {
             Height = 38, Background = Panel2, Foreground = Text, BorderBrush = Stroke,
             BorderThickness = new Thickness(1), Padding = new Thickness(10, 0, 6, 0),
-            VerticalContentAlignment = VerticalAlignment.Center
+            VerticalContentAlignment = VerticalAlignment.Center,
+            MaxDropDownHeight = 320,
+            Style = DarkTargetComboStyle()
         };
         _target.SelectionChanged += (s, e) => UpdateCommandPreview();
         Grid.SetColumn(_target, 0);
@@ -1244,9 +1247,153 @@ internal sealed class MainWindow : Window
         public override string ToString() { return Display; }
     }
 
+    Style DarkTargetComboStyle()
+    {
+        var style = new Style(typeof(ComboBox));
+        style.Setters.Add(new Setter(Control.BackgroundProperty, Panel2));
+        style.Setters.Add(new Setter(Control.ForegroundProperty, Text));
+        style.Setters.Add(new Setter(Control.BorderBrushProperty, Stroke));
+        style.Setters.Add(new Setter(Control.BorderThicknessProperty, new Thickness(1)));
+        style.Setters.Add(new Setter(ItemsControl.ItemContainerStyleProperty, DarkComboItemStyle()));
+
+        var template = new ControlTemplate(typeof(ComboBox));
+        var root = new FrameworkElementFactory(typeof(Grid));
+
+        var toggle = new FrameworkElementFactory(typeof(ToggleButton));
+        toggle.SetValue(ToggleButton.FocusableProperty, false);
+        toggle.SetValue(ToggleButton.ClickModeProperty, ClickMode.Press);
+        toggle.SetBinding(ToggleButton.IsCheckedProperty, new Binding("IsDropDownOpen")
+        {
+            Mode = BindingMode.TwoWay,
+            RelativeSource = new RelativeSource(RelativeSourceMode.TemplatedParent)
+        });
+        toggle.SetBinding(ContentControl.ContentProperty, new Binding("SelectionBoxItem")
+        {
+            RelativeSource = new RelativeSource(RelativeSourceMode.TemplatedParent)
+        });
+        toggle.SetValue(Control.TemplateProperty, DarkComboToggleTemplate());
+        root.AppendChild(toggle);
+
+        var popup = new FrameworkElementFactory(typeof(Popup));
+        popup.Name = "PART_Popup";
+        popup.SetValue(Popup.AllowsTransparencyProperty, true);
+        popup.SetValue(Popup.PlacementProperty, PlacementMode.Bottom);
+        popup.SetValue(Popup.StaysOpenProperty, false);
+        popup.SetBinding(Popup.IsOpenProperty, new Binding("IsDropDownOpen")
+        {
+            Mode = BindingMode.TwoWay,
+            RelativeSource = new RelativeSource(RelativeSourceMode.TemplatedParent)
+        });
+        popup.SetBinding(Popup.PlacementTargetProperty, new Binding
+        {
+            RelativeSource = new RelativeSource(RelativeSourceMode.TemplatedParent)
+        });
+        popup.SetBinding(FrameworkElement.WidthProperty, new Binding("ActualWidth")
+        {
+            RelativeSource = new RelativeSource(RelativeSourceMode.TemplatedParent)
+        });
+
+        var popupBorder = new FrameworkElementFactory(typeof(Border));
+        popupBorder.SetValue(Border.BackgroundProperty, Panel);
+        popupBorder.SetValue(Border.BorderBrushProperty, StrokeHi);
+        popupBorder.SetValue(Border.BorderThicknessProperty, new Thickness(1));
+        popupBorder.SetValue(Border.CornerRadiusProperty, new CornerRadius(6));
+        popupBorder.SetValue(Border.MarginProperty, new Thickness(0, 4, 0, 0));
+
+        var scroll = new FrameworkElementFactory(typeof(ScrollViewer));
+        scroll.SetValue(ScrollViewer.CanContentScrollProperty, true);
+        scroll.SetValue(ScrollViewer.VerticalScrollBarVisibilityProperty, ScrollBarVisibility.Auto);
+        scroll.SetValue(ScrollViewer.HorizontalScrollBarVisibilityProperty, ScrollBarVisibility.Disabled);
+        scroll.AppendChild(new FrameworkElementFactory(typeof(ItemsPresenter)));
+        popupBorder.AppendChild(scroll);
+        popup.AppendChild(popupBorder);
+        root.AppendChild(popup);
+
+        template.VisualTree = root;
+        style.Setters.Add(new Setter(Control.TemplateProperty, template));
+        return style;
+    }
+
+    ControlTemplate DarkComboToggleTemplate()
+    {
+        var template = new ControlTemplate(typeof(ToggleButton));
+        var border = new FrameworkElementFactory(typeof(Border));
+        border.SetValue(Border.BackgroundProperty, Panel2);
+        border.SetValue(Border.BorderBrushProperty, Stroke);
+        border.SetValue(Border.BorderThicknessProperty, new Thickness(1));
+        border.SetValue(Border.CornerRadiusProperty, new CornerRadius(6));
+
+        var grid = new FrameworkElementFactory(typeof(Grid));
+        var content = new FrameworkElementFactory(typeof(ContentPresenter));
+        content.SetBinding(ContentPresenter.ContentProperty, new Binding("Content")
+        {
+            RelativeSource = new RelativeSource(RelativeSourceMode.TemplatedParent)
+        });
+        content.SetBinding(ContentPresenter.ContentTemplateProperty, new Binding("ContentTemplate")
+        {
+            RelativeSource = new RelativeSource(RelativeSourceMode.TemplatedParent)
+        });
+        content.SetValue(FrameworkElement.MarginProperty, new Thickness(10, 0, 34, 0));
+        content.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
+        content.SetValue(TextElement.ForegroundProperty, Text);
+        grid.AppendChild(content);
+
+        var arrow = new FrameworkElementFactory(typeof(TextBlock));
+        arrow.SetValue(TextBlock.TextProperty, "⌄");
+        arrow.SetValue(TextBlock.ForegroundProperty, Muted);
+        arrow.SetValue(TextBlock.FontSizeProperty, 17.0);
+        arrow.SetValue(FrameworkElement.HorizontalAlignmentProperty, HorizontalAlignment.Right);
+        arrow.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
+        arrow.SetValue(FrameworkElement.MarginProperty, new Thickness(0, 0, 11, 2));
+        grid.AppendChild(arrow);
+        border.AppendChild(grid);
+        template.VisualTree = border;
+        return template;
+    }
+
+    Style DarkComboItemStyle()
+    {
+        var style = new Style(typeof(ComboBoxItem));
+        style.Setters.Add(new Setter(Control.BackgroundProperty, Brushes.Transparent));
+        style.Setters.Add(new Setter(Control.ForegroundProperty, Text));
+        style.Setters.Add(new Setter(Control.PaddingProperty, new Thickness(10, 8, 10, 8)));
+        style.Setters.Add(new Setter(Control.HorizontalContentAlignmentProperty, HorizontalAlignment.Stretch));
+
+        var template = new ControlTemplate(typeof(ComboBoxItem));
+        var border = new FrameworkElementFactory(typeof(Border));
+        border.SetBinding(Border.BackgroundProperty, new Binding("Background")
+        {
+            RelativeSource = new RelativeSource(RelativeSourceMode.TemplatedParent)
+        });
+        border.SetBinding(Border.PaddingProperty, new Binding("Padding")
+        {
+            RelativeSource = new RelativeSource(RelativeSourceMode.TemplatedParent)
+        });
+        var content = new FrameworkElementFactory(typeof(ContentPresenter));
+        content.SetBinding(ContentPresenter.ContentProperty, new Binding("Content")
+        {
+            RelativeSource = new RelativeSource(RelativeSourceMode.TemplatedParent)
+        });
+        content.SetValue(TextElement.ForegroundProperty, Text);
+        border.AppendChild(content);
+        template.VisualTree = border;
+        style.Setters.Add(new Setter(Control.TemplateProperty, template));
+
+        var hover = new Trigger { Property = UIElement.IsMouseOverProperty, Value = true };
+        hover.Setters.Add(new Setter(Control.BackgroundProperty, B("#252C39")));
+        style.Triggers.Add(hover);
+        var selected = new Trigger { Property = Selector.IsSelectedProperty, Value = true };
+        selected.Setters.Add(new Setter(Control.BackgroundProperty, B("#263B66")));
+        style.Triggers.Add(selected);
+        return style;
+    }
+
     void RefreshTargets()
     {
-        var items = new List<WinItem> { new WinItem { Display = "自动检测  (Codex / ChatGPT)", Pid = 0 } };
+        var items = new List<WinItem>
+        {
+            new WinItem { Display = "默认：自动检测 Codex / ChatGPT", Pid = 0 }
+        };
         uint self = (uint)Process.GetCurrentProcess().Id;
         Native.EnumWindows((h, l) =>
         {
@@ -1262,9 +1409,10 @@ internal sealed class MainWindow : Window
             if (pid == self) return true;
             string exe = Native.ExeName(pid);
             if (exe == "wallpaper64.exe" || exe == "wallpaper32.exe") return true;
+            if (title == "Program Manager") return true;
             string disp = title;
             if (disp.Length > 46) disp = disp.Substring(0, 45) + "\u2026";
-            items.Add(new WinItem { Display = disp + "   ·   " + exe, Pid = pid });
+            items.Add(new WinItem { Display = disp + "  ·  " + exe + "  ·  PID " + pid, Pid = pid });
             return true;
         }, IntPtr.Zero);
 
