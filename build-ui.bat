@@ -35,6 +35,8 @@ echo [build-ui] %CSC%
   /reference:"%WPF%\PresentationCore.dll" ^
   /reference:"%WPF%\PresentationFramework.dll" ^
   /reference:"%FW%\System.Xaml.dll" ^
+  /reference:"%FW%\System.Windows.Forms.dll" ^
+  /reference:"%FW%\System.Drawing.dll" ^
   "%ROOT%src\WeCodexBgUi.cs" "%ROOT%src\WeJson.cs"
 if errorlevel 1 (
   echo [build-ui] FAILED

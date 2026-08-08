@@ -170,6 +170,7 @@ internal static class WeCodexBg
     static bool _targetExSaved, _contentExSaved, _wallSaved, _weLaunched;
     static RECT _lastRect;
     static bool _wallHidden, _restored = true;
+    static int _lastClickThrough;
     static volatile bool _stopping;
     static Mode _mode = Mode.Composite;
     static Place _place = Place.ChildBottom;
@@ -457,6 +458,11 @@ internal static class WeCodexBg
             return;
         }
         bool asChild = _place == Place.ChildBottom;
+        if (_place == Place.TopLevelAbove && unchecked(Environment.TickCount - _lastClickThrough) >= 500)
+        {
+            MakeClickThroughTree(_wall);      // WE can create renderer children after launch
+            _lastClickThrough = Environment.TickCount;
+        }
         if (!asChild)
         {
             bool visible = IsWindowVisible(_target) && !IsIconic(_target) && !Cloaked(_target);
@@ -586,10 +592,14 @@ internal static class WeCodexBg
     // tree or a child renderer HWND would still swallow clicks.
     static void MakeClickThroughTree(IntPtr root)
     {
-        SetStyle(root, GWL_EXSTYLE, Style(root, GWL_EXSTYLE) | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE);
+        long ex = Style(root, GWL_EXSTYLE);
+        long want = ex | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
+        if (want != ex) SetStyle(root, GWL_EXSTYLE, want);
         EnumChildWindows(root, (c, lp) =>
         {
-            SetStyle(c, GWL_EXSTYLE, Style(c, GWL_EXSTYLE) | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE);
+            long childEx = Style(c, GWL_EXSTYLE);
+            long childWant = childEx | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
+            if (childWant != childEx) SetStyle(c, GWL_EXSTYLE, childWant);
             return true;
         }, IntPtr.Zero);
     }

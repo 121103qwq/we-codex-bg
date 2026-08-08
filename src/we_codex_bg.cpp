@@ -187,6 +187,7 @@ struct State {
 
     RECT lastRect{ 0, 0, 0, 0 };
     bool wallHidden = false;
+    DWORD lastClickThrough = 0;
     bool restored = true;             // false once something has actually been changed
 
     Mode  mode = Mode::Composite;
@@ -438,6 +439,7 @@ static void ApplyRoundedCorners(HWND h, int w, int ht, int radius) {
     if (!rgn) return;
     if (!SetWindowRgn(h, rgn, TRUE)) DeleteObject(rgn);   // system owns it on success
 }
+static void MakeClickThroughTree(HWND root);
 
 static void Sync(bool force) {
     if (g_stopping) return;
@@ -446,6 +448,10 @@ static void Sync(bool force) {
         return;
     }
     const bool asChild = (g.place == Place::ChildBottom);
+    if (g.place == Place::TopLevelAbove && GetTickCount() - g.lastClickThrough >= 500) {
+        MakeClickThroughTree(g.wall);  // WE can create renderer children after launch
+        g.lastClickThrough = GetTickCount();
+    }
 
     if (!asChild) {   // a child window is hidden together with its parent already
         bool visible = IsWindowVisible(g.target) && !IsIconic(g.target) && !IsCloaked(g.target);
@@ -540,12 +546,14 @@ static void ForceRepaint(HWND h) {
 // renderer lives in a child HWND would still swallow clicks.  Stamp the whole tree.
 static BOOL CALLBACK ClickThroughProc(HWND c, LPARAM) {
     LONG_PTR ex = GetWindowLongPtrW(c, GWL_EXSTYLE);
-    SetWindowLongPtrW(c, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE);
+    LONG_PTR want = ex | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
+    if (want != ex) SetWindowLongPtrW(c, GWL_EXSTYLE, want);
     return TRUE;
 }
 static void MakeClickThroughTree(HWND root) {
     LONG_PTR ex = GetWindowLongPtrW(root, GWL_EXSTYLE);
-    SetWindowLongPtrW(root, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE);
+    LONG_PTR want = ex | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
+    if (want != ex) SetWindowLongPtrW(root, GWL_EXSTYLE, want);
     EnumChildWindows(root, ClickThroughProc, 0);
 }
 

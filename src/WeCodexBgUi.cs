@@ -82,6 +82,7 @@ internal sealed class MainWindow : Window
     RichTextBox _log;
     Paragraph _logPara;
     Ellipse _statusDot;
+    System.Windows.Forms.NotifyIcon _tray;
     readonly List<Border> _modeCards = new List<Border>();
 
     // ------------------------------------------------------------------ state --
@@ -92,6 +93,7 @@ internal sealed class MainWindow : Window
     Process _proc;
     volatile bool _running;
     volatile bool _stopping;
+    bool _exitRequested;
 
     readonly string _appDir = AppDomain.CurrentDomain.BaseDirectory;
     string HelperPath { get { return IOPath.Combine(_appDir, "we-codex-bg.exe"); } }
@@ -133,6 +135,7 @@ internal sealed class MainWindow : Window
         grid.Children.Add(BuildBody());
         root.Child = grid;
         Content = root;
+        CreateTrayIcon();
 
         LoadSettings();
         UpdateModeVisuals();
@@ -159,7 +162,7 @@ internal sealed class MainWindow : Window
         var btns = new StackPanel { Orientation = Orientation.Horizontal };
         DockPanel.SetDock(btns, Dock.Right);
         btns.Children.Add(CaptionButton("\uE921", false, () => WindowState = WindowState.Minimized));
-        btns.Children.Add(CaptionButton("\uE8BB", true,  Close));
+        btns.Children.Add(CaptionButton("\uE8BB", true, HideToTray));
         dock.Children.Add(btns);
 
         // brand on the left
@@ -1770,6 +1773,14 @@ internal sealed class MainWindow : Window
 
     void OnClosing(object sender, System.ComponentModel.CancelEventArgs e)
     {
+        if (!_exitRequested)
+        {
+            e.Cancel = true;
+            HideToTray();
+            return;
+        }
+
+        if (_tray != null) { _tray.Visible = false; _tray.Dispose(); _tray = null; }
         SaveSettings();
         if (_running && _proc != null)
         {
@@ -1787,6 +1798,37 @@ internal sealed class MainWindow : Window
             }
             catch { }
         }
+    }
+
+    void CreateTrayIcon()
+    {
+        _tray = new System.Windows.Forms.NotifyIcon
+        {
+            Icon = System.Drawing.SystemIcons.Application,
+            Text = "WE · Codex 背景",
+            Visible = true
+        };
+        var menu = new System.Windows.Forms.ContextMenuStrip();
+        var open = new System.Windows.Forms.ToolStripMenuItem("打开");
+        open.Click += (s, e) => RestoreFromTray();
+        var exit = new System.Windows.Forms.ToolStripMenuItem("退出");
+        exit.Click += (s, e) => { _exitRequested = true; Close(); };
+        menu.Items.Add(open);
+        menu.Items.Add(exit);
+        _tray.ContextMenuStrip = menu;
+        _tray.DoubleClick += (s, e) => RestoreFromTray();
+    }
+
+    void HideToTray()
+    {
+        Hide();
+    }
+
+    void RestoreFromTray()
+    {
+        Show();
+        if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
+        Activate();
     }
 
     // -------------------------------------------------------- widget factories --
