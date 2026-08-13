@@ -420,14 +420,40 @@ internal sealed class MainWindow : Window
 
             if (j.TryGetValue("preview", out v) && v.Length > 0)
             {
-                string img = IOPath.Combine(dir, v);
-                if (File.Exists(img)) w.Thumb = LoadThumb(img);
+                string img;
+                if (TryResolvePreviewPath(dir, v, out img) && File.Exists(img))
+                    w.Thumb = LoadThumb(img);
             }
             w.Haystack = (w.Title + " " + w.WorkshopId + " " + w.Tags).ToLowerInvariant();
             list.Add(w);
         }
         list.Sort((a, b) => string.Compare(a.Title, b.Title, StringComparison.CurrentCultureIgnoreCase));
         return list;
+    }
+
+    // project.json is supplied by wallpaper authors.  Keep its preview path
+    // inside the project directory so probing/loading it cannot access UNC or
+    // other attacker-controlled locations.
+    static bool TryResolvePreviewPath(string projectDir, string preview, out string resolved)
+    {
+        resolved = null;
+        try
+        {
+            if (IOPath.IsPathRooted(preview)) return false;
+
+            string root = IOPath.GetFullPath(projectDir)
+                .TrimEnd(IOPath.DirectorySeparatorChar, IOPath.AltDirectorySeparatorChar)
+                + IOPath.DirectorySeparatorChar;
+            string candidate = IOPath.GetFullPath(IOPath.Combine(root, preview));
+            if (!candidate.StartsWith(root, StringComparison.OrdinalIgnoreCase)) return false;
+
+            resolved = candidate;
+            return true;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
     }
 
     // Every directory that may hold a project.json: workshop content for app
