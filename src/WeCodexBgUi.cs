@@ -420,8 +420,8 @@ internal sealed class MainWindow : Window
 
             if (j.TryGetValue("preview", out v) && v.Length > 0)
             {
-                string img = IOPath.Combine(dir, v);
-                if (File.Exists(img)) w.Thumb = LoadThumb(img);
+                string img;
+                if (TryResolvePreviewPath(dir, v, out img)) w.Thumb = LoadThumb(img);
             }
             w.Haystack = (w.Title + " " + w.WorkshopId + " " + w.Tags).ToLowerInvariant();
             list.Add(w);
@@ -516,19 +516,54 @@ internal sealed class MainWindow : Window
         return outp;
     }
 
+    // project.json is supplied by Workshop content and must not be allowed to
+    // turn an automatic library scan into a request to a UNC/WebDAV endpoint.
+    // Accept only ordinary relative image names whose canonical path stays in
+    // the wallpaper directory.
+    static bool TryResolvePreviewPath(string wallpaperDir, string preview, out string file)
+    {
+        file = null;
+        if (string.IsNullOrWhiteSpace(preview) || IOPath.IsPathRooted(preview)) return false;
+
+        try
+        {
+            string root = IOPath.GetFullPath(wallpaperDir)
+                .TrimEnd(IOPath.DirectorySeparatorChar, IOPath.AltDirectorySeparatorChar)
+                + IOPath.DirectorySeparatorChar;
+            string candidate = IOPath.GetFullPath(IOPath.Combine(root, preview));
+            if (!candidate.StartsWith(root, StringComparison.OrdinalIgnoreCase)) return false;
+
+            string ext = IOPath.GetExtension(candidate).ToLowerInvariant();
+            if (ext != ".jpg" && ext != ".jpeg" && ext != ".png" &&
+                ext != ".bmp" && ext != ".gif") return false;
+
+            file = candidate;
+            return true;
+        }
+        catch { return false; }
+    }
+
     static ImageSource LoadThumb(string file)
     {
         try
         {
-            var bi = new BitmapImage();
-            bi.BeginInit();
-            bi.UriSource = new Uri(file, UriKind.Absolute);
-            bi.DecodePixelWidth = 96;                 // keep memory small
-            bi.CacheOption = BitmapCacheOption.OnLoad;
-            bi.CreateOptions = BitmapCreateOptions.IgnoreColorProfile;
-            bi.EndInit();
-            bi.Freeze();                              // required to cross threads
-            return bi;
+            const long MaxPreviewBytes = 20L * 1024 * 1024;
+            var info = new FileInfo(file);
+            if (!info.Exists || info.Length <= 0 || info.Length > MaxPreviewBytes) return null;
+
+            using (var input = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read,
+                                              64 * 1024, FileOptions.SequentialScan))
+            {
+                var bi = new BitmapImage();
+                bi.BeginInit();
+                bi.StreamSource = input;
+                bi.DecodePixelWidth = 96;             // keep memory small
+                bi.CacheOption = BitmapCacheOption.OnLoad;
+                bi.CreateOptions = BitmapCreateOptions.IgnoreColorProfile;
+                bi.EndInit();
+                bi.Freeze();                          // required to cross threads
+                return bi;
+            }
         }
         catch { return null; }
     }
