@@ -5,7 +5,7 @@
 // its own window (wallpaper64.exe -control openWallpaper -playInWindow ...) and
 // this helper only does window plumbing:
 //
-//   composite (default) : SetParent the wallpaper window INTO the Codex window as
+//   composite           : SetParent the wallpaper window INTO the Codex window as
 //                         the bottom-most child, then make only the content child
 //                         window (the one that paints the page) layered with
 //                         LWA_ALPHA.  Window frame / title bar stay opaque, the
@@ -153,6 +153,7 @@ static Place PlaceOf(Mode m) {
 struct Options {
     std::wstring targetTitle, targetClass, targetExe;
     DWORD        targetPid = 0;
+    HWND         targetHwnd = nullptr;
     std::wstring weExe, wallpaper, attachTitle;
     std::wstring weWindow     = L"CodexWallpaperHost";
     std::wstring contentClass;                 // which child window to fade (composite)
@@ -167,6 +168,7 @@ struct Options {
     int   round      = 0;
     bool  keepWe     = false;
     bool  fallback   = true;
+    bool  strictWeWindow = false;
     bool  listOnly = false, treeOnly = false, restoreOnly = false;
 };
 
@@ -235,6 +237,16 @@ static bool LooksLikeWeProcess(const std::wstring& exe) {
 }
 
 static HWND FindTarget(const Options& o) {
+    if (o.targetHwnd) {
+        if (!IsWindow(o.targetHwnd) || GetAncestor(o.targetHwnd, GA_ROOT) != o.targetHwnd)
+            return nullptr;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(o.targetHwnd, &pid);
+        if (o.targetPid && pid != o.targetPid) return nullptr;
+        if (LooksLikeWeProcess(BaseName(ExeOfPid(pid)))) return nullptr;
+        return o.targetHwnd;
+    }
+
     bool useDefaults = o.targetTitle.empty() && o.targetClass.empty() &&
                        o.targetExe.empty() && o.targetPid == 0;
     HWND fg = GetForegroundWindow();
@@ -293,6 +305,7 @@ static HWND FindWeWindow(const Options& o, bool* exact = nullptr) {
     WeScan x{ &o, nullptr, nullptr, 0 };
     EnumWindows(WeScanProc, reinterpret_cast<LPARAM>(&x));
     if (exact) *exact = (x.named != nullptr);
+    if (o.strictWeWindow) return x.named;
     return x.named ? x.named : x.best;
 }
 
@@ -849,8 +862,13 @@ static LRESULT CALLBACK MsgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_HOTKEY:
         if (w == HOTKEY_PANIC) {
             Out(L"[i] 收到紧急还原热键 (Ctrl+Alt+Shift+W)。");
-            RestoreAll();
-            PostThreadMessageW(g_mainThread, WM_QUIT, 0, 0);
+            std::vector<HWND> helpers;
+            for (const wchar_t* cls : { L"WeCodexBgMsg", L"WeCodexBgMsgCs" }) {
+                HWND after = nullptr;
+                while ((after = FindWindowExW(HWND_MESSAGE, after, cls, nullptr)) != nullptr)
+                    helpers.push_back(after);
+            }
+            for (HWND helper : helpers) PostMessageW(helper, WM_CLOSE, 0, 0);
         }
         return 0;
     case WM_CLOSE:           RestoreAll(); PostQuitMessage(0); return 0;
@@ -895,9 +913,9 @@ L"Usage: we-codex-bg.exe [options]\n"
 L"\n"
 L"Modes\n"
 L"  --mode composite   embed the wallpaper as the bottom-most child window and fade\n"
-L"                     only the content child window (frame stays opaque)  [default]\n"
+L"                     only the content child window (frame stays opaque)\n"
 L"  --mode embed       embed only, no transparency (plumbing test)\n"
-L"  --mode alpha       wallpaper pinned below the window + whole window translucent\n"
+L"  --mode alpha       wallpaper pinned below the window + whole window translucent [default]\n"
 L"  --mode overlay     wallpaper pinned above the window as a click-through film;\n"
 L"                     the Codex window itself is never modified\n"
 L"  --alpha 0-255      host opacity for composite / alpha (default 235)\n"
@@ -912,11 +930,13 @@ L"  --title <substr>   match window title (default: Codex / ChatGPT)\n"
 L"  --class <substr>   match window class\n"
 L"  --exe <name.exe>   match process image name\n"
 L"  --pid <n>          match process id\n"
+L"  --hwnd <n|0xHEX>   match one exact top-level window\n"
 L"\n"
 L"Wallpaper Engine\n"
 L"  --we <path>        wallpaper64.exe (auto-detected if omitted)\n"
 L"  --wallpaper <path> project.json / mp4 / gif ...; launches WE for you\n"
 L"  --we-window <name> -playInWindow name (default CodexWallpaperHost)\n"
+L"  --strict-we-window require that exact playInWindow name (multi-window safe)\n"
 L"  --attach-title <s> attach to an already open WE window by title substring\n"
 L"  --keep-we          leave the wallpaper window open on exit\n"
 L"\n"
@@ -945,12 +965,20 @@ static bool ParseArgs(int argc, wchar_t** argv, Options& o) {
         else if (a == L"--class")        { if (!want(L"--class")) return false; o.targetClass = argv[++i]; }
         else if (a == L"--exe")          { if (!want(L"--exe")) return false; o.targetExe = argv[++i]; }
         else if (a == L"--pid")          { if (!want(L"--pid")) return false; o.targetPid = (DWORD)wcstoul(argv[++i], nullptr, 10); }
+        else if (a == L"--hwnd") {
+            if (!want(L"--hwnd")) return false;
+            wchar_t* end = nullptr;
+            unsigned long long value = wcstoull(argv[++i], &end, 0);
+            if (!value || !end || *end != L'\0') { Out(L"[!] invalid --hwnd value: %ls", argv[i]); return false; }
+            o.targetHwnd = (HWND)(ULONG_PTR)value;
+        }
         else if (a == L"--we")           { if (!want(L"--we")) return false; o.weExe = argv[++i]; }
         else if (a == L"--wallpaper")    { if (!want(L"--wallpaper")) return false; o.wallpaper = argv[++i]; }
         else if (a == L"--we-window")    { if (!want(L"--we-window")) return false; o.weWindow = argv[++i]; }
         else if (a == L"--attach-title") { if (!want(L"--attach-title")) return false; o.attachTitle = argv[++i]; }
         else if (a == L"--content-class"){ if (!want(L"--content-class")) return false; o.contentClass = argv[++i]; }
         else if (a == L"--keep-we")      o.keepWe = true;
+        else if (a == L"--strict-we-window") o.strictWeWindow = true;
         else if (a == L"--no-fallback")  o.fallback = false;
         else if (a == L"--mode") {
             if (!want(L"--mode")) return false;

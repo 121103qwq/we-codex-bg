@@ -7,6 +7,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -105,6 +106,8 @@ internal static class WeCodexBg
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern ushort RegisterClassExW(ref WNDCLASSEX c);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr CreateWindowExW(uint exStyle,
         string cls, string name, uint style, int x, int y, int w, int h, IntPtr parent, IntPtr menu, IntPtr inst, IntPtr p);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindowExW(
+        IntPtr parent, IntPtr after, string cls, string title);
     [DllImport("user32.dll")] static extern bool DestroyWindow(IntPtr h);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr DefWindowProcW(IntPtr h, uint m, IntPtr w, IntPtr l);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetMessageW(out MSG m, IntPtr h, uint min, uint max);
@@ -152,13 +155,14 @@ internal static class WeCodexBg
     {
         public string Title = "", Class = "", Exe = "", ContentClass = "";
         public uint Pid;
+        public IntPtr Hwnd;
         public string WeExe = "", Wallpaper = "", AttachTitle = "";
         public string WeWindow = "CodexWallpaperHost";
         // alpha default: it only layers the TOP-LEVEL window, which every host
         // tolerates.  composite touches the content child and is unsafe on Chromium.
         public Mode Mode = Mode.Alpha;
         public byte Alpha = 235, Film = 70, WallAlpha = 255;
-        public bool ClientOnly = true, KeepWe = false, Fallback = true;
+        public bool ClientOnly = true, KeepWe = false, Fallback = true, StrictWeWindow = false;
         public int Fps = 30, Round = 0;
         public bool ListOnly, TreeOnly, RestoreOnly;
     }
@@ -265,6 +269,16 @@ internal static class WeCodexBg
 
     static IntPtr FindTarget(Options o)
     {
+        if (o.Hwnd != IntPtr.Zero)
+        {
+            if (!IsWindow(o.Hwnd) || GetAncestor(o.Hwnd, 2 /*GA_ROOT*/) != o.Hwnd) return IntPtr.Zero;
+            uint pid;
+            GetWindowThreadProcessId(o.Hwnd, out pid);
+            if (o.Pid != 0 && pid != o.Pid) return IntPtr.Zero;
+            if (IsWe(ExeName(pid))) return IntPtr.Zero;
+            return o.Hwnd;
+        }
+
         bool defaults = o.Title == "" && o.Class == "" && o.Exe == "" && o.Pid == 0;
         IntPtr fg = GetForegroundWindow(), best = IntPtr.Zero;
         int bestScore = 0;
@@ -321,6 +335,7 @@ internal static class WeCodexBg
         }, IntPtr.Zero);
 
         exact = named != IntPtr.Zero;
+        if (o.StrictWeWindow) return named;
         return named != IntPtr.Zero ? named : best;
     }
 
@@ -777,9 +792,9 @@ Usage: we-codex-bg.exe [options]
 
 Modes
   --mode composite   embed the wallpaper as the bottom-most child window and fade
-                     only the content child window (frame stays opaque)  [default]
+                     only the content child window (frame stays opaque)
   --mode embed       embed only, no transparency (plumbing test)
-  --mode alpha       wallpaper pinned below the window + whole window translucent
+  --mode alpha       wallpaper pinned below the window + whole window translucent [default]
   --mode overlay     wallpaper pinned above the window as a click-through film;
                      the Codex window itself is never modified
   --alpha 0-255      host opacity for composite / alpha (default 235)
@@ -794,11 +809,13 @@ Target window
   --class <substr>   match window class
   --exe <name.exe>   match process image name
   --pid <n>          match process id
+  --hwnd <n|0xHEX>   match one exact top-level window
 
 Wallpaper Engine
   --we <path>        wallpaper64.exe (auto-detected if omitted)
   --wallpaper <path> project.json / mp4 / gif ...; launches WE for you
   --we-window <name> -playInWindow name (default CodexWallpaperHost)
+  --strict-we-window require that exact playInWindow name (multi-window safe)
   --attach-title <s> attach to an already open WE window by title substring
   --keep-we          leave the wallpaper window open on exit
 
@@ -825,6 +842,15 @@ Geometry / misc
         return int.TryParse(s, out v) ? v : fallback;
     }
 
+    static IntPtr ParseHwnd(string s)
+    {
+        ulong value;
+        bool ok = s.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
+            ? ulong.TryParse(s.Substring(2), NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out value)
+            : ulong.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out value);
+        return ok ? new IntPtr(unchecked((long)value)) : IntPtr.Zero;
+    }
+
     static bool ParseArgs(string[] a, Options o)
     {
         for (int i = 0; i < a.Length; i++)
@@ -835,7 +861,7 @@ Geometry / misc
             {
                 switch (cur)
                 {
-                    case "--title": case "--class": case "--exe": case "--pid":
+                    case "--title": case "--class": case "--exe": case "--pid": case "--hwnd":
                     case "--we": case "--wallpaper": case "--we-window": case "--attach-title":
                     case "--content-class": case "--mode": case "--alpha": case "--film":
                     case "--fps": case "--round":
@@ -849,12 +875,17 @@ Geometry / misc
                 case "--class": o.Class = a[++i]; break;
                 case "--exe": o.Exe = a[++i]; break;
                 case "--pid": o.Pid = ParseUInt(a[++i], 0); break;
+                case "--hwnd":
+                    o.Hwnd = ParseHwnd(a[++i]);
+                    if (o.Hwnd == IntPtr.Zero) { Log("[!] invalid --hwnd value: " + a[i]); return false; }
+                    break;
                 case "--we": o.WeExe = a[++i]; break;
                 case "--wallpaper": o.Wallpaper = a[++i]; break;
                 case "--we-window": o.WeWindow = a[++i]; break;
                 case "--attach-title": o.AttachTitle = a[++i]; break;
                 case "--content-class": o.ContentClass = a[++i]; break;
                 case "--keep-we": o.KeepWe = true; break;
+                case "--strict-we-window": o.StrictWeWindow = true; break;
                 case "--no-fallback": o.Fallback = false; break;
                 case "--mode":
                     switch (a[++i].ToLowerInvariant())
@@ -1023,8 +1054,15 @@ Geometry / misc
                     return IntPtr.Zero;
                 case 0x0312:                        // WM_HOTKEY: emergency restore
                     Log("[i] 收到紧急还原热键 (Ctrl+Alt+Shift+W)。");
-                    RestoreAll();
-                    PostThreadMessageW(_mainThread, WM_QUIT, IntPtr.Zero, IntPtr.Zero);
+                    var helpers = new List<IntPtr>();
+                    foreach (string cls in new[] { "WeCodexBgMsg", "WeCodexBgMsgCs" })
+                    {
+                        IntPtr after = IntPtr.Zero;
+                        while ((after = FindWindowExW(new IntPtr(-3), after, cls, null)) != IntPtr.Zero)
+                            helpers.Add(after);
+                    }
+                    foreach (IntPtr helper in helpers)
+                        PostMessageW(helper, 0x0010 /*WM_CLOSE*/, IntPtr.Zero, IntPtr.Zero);
                     return IntPtr.Zero;
                 case WM_CLOSE: RestoreAll(); PostQuitMessage(0); return IntPtr.Zero;
                 case WM_DESTROY: PostQuitMessage(0); return IntPtr.Zero;

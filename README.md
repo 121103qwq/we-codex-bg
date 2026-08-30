@@ -8,7 +8,7 @@
 色键（`LWA_COLORKEY`）已确认不可行，所以现在走的是**窗口嵌入 + 背景合成**四种模式。
 
 现在有**中文图形界面**（`we-codex-bg-ui.exe`）：壁纸库自动扫描 + 按标题搜索、模式选择、
-不透明度滑块、播放/参数控制模块、实时日志。命令行版依然完整保留。
+多目标窗口、透明度滑块、播放/参数控制模块、实时日志。命令行版依然完整保留。
 
 ## 安装
 
@@ -72,7 +72,7 @@ bin\we-codex-bg-ui.exe
 | **模式** 四张卡片：合成 / 透明 / 覆盖 / 嵌入 | `--mode composite\|alpha\|overlay\|embed` |
 | **宿主不透明度** 滑块（合成 / 透明模式下显示） | `--alpha 0-255` |
 | **壁纸膜不透明度** 滑块（覆盖模式下显示） | `--film 0-255` |
-| **目标窗口** 下拉（默认自动检测，可选具体窗口） | `--pid` |
+| **目标窗口** 多选列表（默认所有 Codex / ChatGPT，也可选 Steam、QQ、浏览器等） | `--hwnd` `--pid` |
 | **高级选项**：WE 路径 / 宿主窗口名 / 内容窗口类名 / 圆角 / 轮询频率 / 三个开关 | `--we` `--we-window` `--content-class` `--round` `--fps` `--full` `--keep-we` `--no-fallback` |
 | 底部灰色小字实时显示**最终命令行** | —— |
 | **恢复 Codex 窗口** 按钮 | `--restore` |
@@ -141,8 +141,11 @@ WE 没开时那串写死的目录基本必然落空；现在走注册表 + `libr
 
 几个界面层面的细节：
 
+- **支持多个目标窗口**：勾选多个窗口后，界面会为每个目标启动一个独立 helper 和一个独立的
+  Wallpaper Engine 窗口。同一进程里的多个窗口也能用 HWND 精确区分。多目标模式必须先选择壁纸，
+  不能让多个 helper 同时接管一个已经打开的 WE 窗口。
 - **停止是安全的**：点「停止」不是直接杀进程，而是给辅助程序的 message-only 窗口发
-  `WM_CLOSE`，让它自己走完 `RestoreAll()`；5 秒内没退出才强杀并自动补一次 `--restore`。
+  `WM_CLOSE`，让所有实例各自走完 `RestoreAll()`；5 秒内没退出的实例才会被强杀并执行定向 `--restore`。
   **直接关掉界面窗口也一样**会先把 Codex 窗口还原再退出。
 - 运行期间左侧所有选项会锁定，避免改了参数却与实际运行状态不符。
 - 选项自动保存在 `%LOCALAPPDATA%\we-codex-bg\ui.cfg`，下次打开自动恢复。
@@ -153,15 +156,15 @@ WE 没开时那串写死的目录基本必然落空；现在走注册表 + `libr
 
 | 模式 | 壁纸窗口位置 | 对 Codex 窗口做的事 | 效果 / 代价 |
 |---|---|---|---|
-| `composite`（默认） | `SetParent` 成为 Codex 的**子窗口**，永远置于兄弟窗口最底层 | 只给**内容子窗口**（真正画页面那个 HWND）加 `WS_EX_LAYERED + LWA_ALPHA` | 标题栏/窗口框架保持完全不透明，只有页面内容半透，动画从下面透出。移动缩放最小化全部由父窗口带着走，零 z-order 抖动。缺点：内容整体半透，文字也会淡一点 |
+| `composite` | `SetParent` 成为 Codex 的**子窗口**，永远置于兄弟窗口最底层 | 只给**内容子窗口**（真正画页面那个 HWND）加 `WS_EX_LAYERED + LWA_ALPHA` | 标题栏/窗口框架保持完全不透明，只有页面内容半透，动画从下面透出。移动缩放最小化全部由父窗口带着走，零 z-order 抖动。缺点：内容整体半透，文字也会淡一点 |
 | `embed` | 同上（子窗口 + 最底层） | 什么都不改 | 纯嵌入管线验证；宿主如果哪天支持透明背景，这个模式直接就能用。当前宿主背景不透明时看不到画面 |
 | `alpha` | 独立顶层窗口，钉在 Codex **正下方一层** | 整个 Codex 窗口 `LWA_ALPHA` | 任何宿主都有效（哪怕它只有一个 HWND）。整窗半透，文字淡得最多 |
 | `overlay` | 独立顶层窗口，钉在 Codex **正上方一层**，点击穿透 | **完全不改 Codex 窗口** | 最安全的兜底：动画作为一层半透的膜盖在 UI 上（`--film` 调浓淡）。宿主一旦被 `WS_EX_LAYERED` 弄花/变黑就用这个 |
 
-默认按 `composite → alpha → overlay → embed` 顺序自动降级（API 调用失败才降级；
+默认按 `alpha → overlay → composite → embed` 顺序自动降级（API 调用失败才降级；
 `--no-fallback` 可关掉）。
 
-调参思路：先 `composite`，`--alpha` 从 205 往下调（越小背景越明显、文字越淡）；
+调参思路：先用默认的 `alpha`，优先降低 `--wall-alpha` 压暗壁纸，再微调 `--alpha`；
 文字受不了就改 `--mode overlay --film 50` 这类，让 UI 完全不动。
 
 ---
@@ -270,9 +273,11 @@ bin\we-codex-bg.exe -v
 --film 0-255         overlay 的壁纸不透明度（默认 70）
 --wall-alpha 0-255   其他模式下的壁纸亮度（默认 255，调低可压暗壁纸）
 --content-class <s>  composite 模式指定要淡化的子窗口类名片段
---title / --class / --exe / --pid    指定目标窗口
+--title / --class / --exe / --pid    按属性指定目标窗口
+--hwnd <n|0xHEX>     精确指定一个顶层窗口（多窗口 UI 使用）
 --we <wallpaper64.exe 路径>
 --we-window <名字>   -playInWindow 用的窗口名，默认 CodexWallpaperHost
+--strict-we-window   只接受精确的 -playInWindow 名称，不按尺寸猜测
 --attach-title <s>   按标题片段接管已有的 WE 窗口
 --full               覆盖整窗而不只是客户区
 --round <px>         给壁纸窗口切圆角（Win11 圆角漏边时用）

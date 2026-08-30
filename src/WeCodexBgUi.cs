@@ -23,7 +23,6 @@ using System.Threading;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
-using System.Windows.Data;
 using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Interop;
@@ -79,7 +78,9 @@ internal sealed class MainWindow : Window
     TextBlock _alphaVal, _filmVal, _wallAlphaVal, _statusText, _cmdPreview;
     Border  _alphaRow, _filmRow, _wallAlphaRow, _embedNote;
     CheckBox _full, _keepWe, _noFallback;
-    ComboBox _target;
+    StackPanel _targetHost;
+    TextBlock _targetSummary;
+    Grid _targetControls;
     Button  _startBtn, _stopBtn, _restoreBtn;
     RichTextBox _log;
     Paragraph _logPara;
@@ -92,8 +93,10 @@ internal sealed class MainWindow : Window
 
     string _mode = "alpha";       // safe default: never touches the content child
     readonly List<WallpaperItem> _library = new List<WallpaperItem>();
+    readonly List<TargetChoice> _targetChoices = new List<TargetChoice>();
+    readonly List<HelperSession> _sessions = new List<HelperSession>();
     bool _suppressListSelect;      // set while the list is rebuilt programmatically
-    Process _proc;
+    bool _targetsInitialized;
     volatile bool _running;
     volatile bool _stopping;
     bool _exitRequested;
@@ -1249,189 +1252,181 @@ internal sealed class MainWindow : Window
     {
         var card = Card();
         var sp = (StackPanel)card.Child;
-        sp.Children.Add(SectionHeader("目标窗口", "默认 Codex；也可选择当前可见的 Steam、QQ、浏览器等应用"));
+        sp.Children.Add(SectionHeader("目标窗口", "可同时选择多个窗口；默认包含所有 Codex / ChatGPT 窗口"));
 
-        var row = new Grid { Margin = new Thickness(0, 10, 0, 0) };
-        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        _targetControls = new Grid { Margin = new Thickness(0, 10, 0, 0) };
+        _targetControls.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        _targetControls.RowDefinitions.Add(new RowDefinition { Height = new GridLength(158) });
+        _targetControls.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 
-        _target = new ComboBox
+        var toolbar = new Grid { Margin = new Thickness(0, 0, 0, 7) };
+        toolbar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        toolbar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        toolbar.Children.Add(new TextBlock
         {
-            Height = 38, Background = Panel2, Foreground = Text, BorderBrush = Stroke,
-            BorderThickness = new Thickness(1), Padding = new Thickness(10, 0, 6, 0),
-            VerticalContentAlignment = VerticalAlignment.Center,
-            MaxDropDownHeight = 320,
-            Style = DarkTargetComboStyle()
+            Text = "勾选后会为每个窗口启动独立壁纸实例",
+            Foreground = Faint, FontSize = 10.5, VerticalAlignment = VerticalAlignment.Center
+        });
+        var buttons = new StackPanel { Orientation = Orientation.Horizontal };
+        var clear = SecondaryButton("清空");
+        clear.Width = 62; clear.Height = 30;
+        clear.Click += (s, e) =>
+        {
+            foreach (var choice in _targetChoices) choice.Check.IsChecked = false;
         };
-        _target.SelectionChanged += (s, e) => UpdateCommandPreview();
-        Grid.SetColumn(_target, 0);
-        row.Children.Add(_target);
-
         var refresh = SecondaryButton("刷新");
-        refresh.Margin = new Thickness(8, 0, 0, 0);
-        refresh.Width = 92;
+        refresh.Width = 62; refresh.Height = 30; refresh.Margin = new Thickness(6, 0, 0, 0);
         refresh.Click += (s, e) => RefreshTargets();
-        Grid.SetColumn(refresh, 1);
-        row.Children.Add(refresh);
+        buttons.Children.Add(clear);
+        buttons.Children.Add(refresh);
+        Grid.SetColumn(buttons, 1);
+        toolbar.Children.Add(buttons);
+        Grid.SetRow(toolbar, 0);
+        _targetControls.Children.Add(toolbar);
 
-        sp.Children.Add(row);
+        _targetHost = new StackPanel { Margin = new Thickness(4, 4, 4, 4) };
+        var scroll = new ScrollViewer
+        {
+            Content = _targetHost,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled
+        };
+        var listBorder = new Border
+        {
+            Background = Panel2, BorderBrush = Stroke, BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(8), ClipToBounds = true, Child = scroll
+        };
+        Grid.SetRow(listBorder, 1);
+        _targetControls.Children.Add(listBorder);
+
+        _targetSummary = new TextBlock
+        {
+            Foreground = Muted, FontSize = 10.5, Margin = new Thickness(2, 7, 2, 0),
+            TextWrapping = TextWrapping.Wrap
+        };
+        Grid.SetRow(_targetSummary, 2);
+        _targetControls.Children.Add(_targetSummary);
+        sp.Children.Add(_targetControls);
         return card;
     }
 
     sealed class WinItem
     {
+        public IntPtr Hwnd { get; set; }
         public string Display { get; set; }
+        public string Title { get; set; }
+        public string Exe { get; set; }
         public uint Pid { get; set; }
+        public bool IsCodex { get; set; }
+        public bool IsAuto { get; set; }
         public override string ToString() { return Display; }
     }
 
-    Style DarkTargetComboStyle()
+    sealed class TargetChoice
     {
-        var style = new Style(typeof(ComboBox));
-        style.Setters.Add(new Setter(Control.BackgroundProperty, Panel2));
-        style.Setters.Add(new Setter(Control.ForegroundProperty, Text));
-        style.Setters.Add(new Setter(Control.BorderBrushProperty, Stroke));
-        style.Setters.Add(new Setter(Control.BorderThicknessProperty, new Thickness(1)));
-        style.Setters.Add(new Setter(ItemsControl.ItemContainerStyleProperty, DarkComboItemStyle()));
-
-        var template = new ControlTemplate(typeof(ComboBox));
-        var root = new FrameworkElementFactory(typeof(Grid));
-
-        var toggle = new FrameworkElementFactory(typeof(ToggleButton));
-        toggle.SetValue(ToggleButton.FocusableProperty, false);
-        toggle.SetValue(ToggleButton.ClickModeProperty, ClickMode.Press);
-        toggle.SetBinding(ToggleButton.IsCheckedProperty, new Binding("IsDropDownOpen")
-        {
-            Mode = BindingMode.TwoWay,
-            RelativeSource = new RelativeSource(RelativeSourceMode.TemplatedParent)
-        });
-        toggle.SetBinding(ContentControl.ContentProperty, new Binding("SelectionBoxItem")
-        {
-            RelativeSource = new RelativeSource(RelativeSourceMode.TemplatedParent)
-        });
-        toggle.SetValue(Control.TemplateProperty, DarkComboToggleTemplate());
-        root.AppendChild(toggle);
-
-        var popup = new FrameworkElementFactory(typeof(Popup));
-        popup.Name = "PART_Popup";
-        popup.SetValue(Popup.AllowsTransparencyProperty, true);
-        popup.SetValue(Popup.PlacementProperty, PlacementMode.Bottom);
-        popup.SetValue(Popup.StaysOpenProperty, false);
-        popup.SetBinding(Popup.IsOpenProperty, new Binding("IsDropDownOpen")
-        {
-            Mode = BindingMode.TwoWay,
-            RelativeSource = new RelativeSource(RelativeSourceMode.TemplatedParent)
-        });
-        popup.SetBinding(Popup.PlacementTargetProperty, new Binding
-        {
-            RelativeSource = new RelativeSource(RelativeSourceMode.TemplatedParent)
-        });
-        popup.SetBinding(FrameworkElement.WidthProperty, new Binding("ActualWidth")
-        {
-            RelativeSource = new RelativeSource(RelativeSourceMode.TemplatedParent)
-        });
-
-        var popupBorder = new FrameworkElementFactory(typeof(Border));
-        popupBorder.SetValue(Border.BackgroundProperty, Panel);
-        popupBorder.SetValue(Border.BorderBrushProperty, StrokeHi);
-        popupBorder.SetValue(Border.BorderThicknessProperty, new Thickness(1));
-        popupBorder.SetValue(Border.CornerRadiusProperty, new CornerRadius(6));
-        popupBorder.SetValue(Border.MarginProperty, new Thickness(0, 4, 0, 0));
-
-        var scroll = new FrameworkElementFactory(typeof(ScrollViewer));
-        scroll.SetValue(ScrollViewer.CanContentScrollProperty, true);
-        scroll.SetValue(ScrollViewer.VerticalScrollBarVisibilityProperty, ScrollBarVisibility.Auto);
-        scroll.SetValue(ScrollViewer.HorizontalScrollBarVisibilityProperty, ScrollBarVisibility.Disabled);
-        scroll.AppendChild(new FrameworkElementFactory(typeof(ItemsPresenter)));
-        popupBorder.AppendChild(scroll);
-        popup.AppendChild(popupBorder);
-        root.AppendChild(popup);
-
-        template.VisualTree = root;
-        style.Setters.Add(new Setter(Control.TemplateProperty, template));
-        return style;
+        public WinItem Item { get; set; }
+        public CheckBox Check { get; set; }
     }
 
-    ControlTemplate DarkComboToggleTemplate()
+    sealed class HelperSession
     {
-        var template = new ControlTemplate(typeof(ToggleButton));
-        var border = new FrameworkElementFactory(typeof(Border));
-        border.SetValue(Border.BackgroundProperty, Panel2);
-        border.SetValue(Border.BorderBrushProperty, Stroke);
-        border.SetValue(Border.BorderThicknessProperty, new Thickness(1));
-        border.SetValue(Border.CornerRadiusProperty, new CornerRadius(6));
-
-        var grid = new FrameworkElementFactory(typeof(Grid));
-        var content = new FrameworkElementFactory(typeof(ContentPresenter));
-        content.SetBinding(ContentPresenter.ContentProperty, new Binding("Content")
-        {
-            RelativeSource = new RelativeSource(RelativeSourceMode.TemplatedParent)
-        });
-        content.SetBinding(ContentPresenter.ContentTemplateProperty, new Binding("ContentTemplate")
-        {
-            RelativeSource = new RelativeSource(RelativeSourceMode.TemplatedParent)
-        });
-        content.SetValue(FrameworkElement.MarginProperty, new Thickness(10, 0, 34, 0));
-        content.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
-        content.SetValue(TextElement.ForegroundProperty, Text);
-        grid.AppendChild(content);
-
-        var arrow = new FrameworkElementFactory(typeof(TextBlock));
-        arrow.SetValue(TextBlock.TextProperty, "⌄");
-        arrow.SetValue(TextBlock.ForegroundProperty, Muted);
-        arrow.SetValue(TextBlock.FontSizeProperty, 17.0);
-        arrow.SetValue(FrameworkElement.HorizontalAlignmentProperty, HorizontalAlignment.Right);
-        arrow.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
-        arrow.SetValue(FrameworkElement.MarginProperty, new Thickness(0, 0, 11, 2));
-        grid.AppendChild(arrow);
-        border.AppendChild(grid);
-        template.VisualTree = border;
-        return template;
+        public WinItem Target { get; set; }
+        public Process Process { get; set; }
+        public string WeWindow { get; set; }
+        public bool StopRequested { get; set; }
+        public bool StopWaitFinished { get; set; }
     }
 
-    Style DarkComboItemStyle()
+    CheckBox TargetCheck(WinItem item, bool selected)
     {
-        var style = new Style(typeof(ComboBoxItem));
-        style.Setters.Add(new Setter(Control.BackgroundProperty, Brushes.Transparent));
-        style.Setters.Add(new Setter(Control.ForegroundProperty, Text));
-        style.Setters.Add(new Setter(Control.PaddingProperty, new Thickness(10, 8, 10, 8)));
-        style.Setters.Add(new Setter(Control.HorizontalContentAlignmentProperty, HorizontalAlignment.Stretch));
+        var cb = new CheckBox
+        {
+            IsChecked = selected, Tag = item, Foreground = Text, Cursor = Cursors.Hand,
+            Margin = new Thickness(6, 4, 6, 4), HorizontalContentAlignment = HorizontalAlignment.Stretch
+        };
+        var text = new StackPanel();
+        text.Children.Add(new TextBlock
+        {
+            Text = item.IsAuto ? "自动包含所有 Codex / ChatGPT 窗口" : item.Title,
+            Foreground = Text, FontSize = 12, TextTrimming = TextTrimming.CharacterEllipsis
+        });
+        text.Children.Add(new TextBlock
+        {
+            Text = item.IsAuto ? "启动时按当前可见窗口展开；适合同时运行多个 agent"
+                               : item.Exe + "  ·  PID " + item.Pid + "  ·  HWND 0x" + item.Hwnd.ToInt64().ToString("X"),
+            Foreground = Faint, FontSize = 10, TextTrimming = TextTrimming.CharacterEllipsis
+        });
+        cb.Content = text;
+        cb.Checked += TargetSelectionChanged;
+        cb.Unchecked += TargetSelectionChanged;
+        return cb;
+    }
 
-        var template = new ControlTemplate(typeof(ComboBoxItem));
-        var border = new FrameworkElementFactory(typeof(Border));
-        border.SetBinding(Border.BackgroundProperty, new Binding("Background")
-        {
-            RelativeSource = new RelativeSource(RelativeSourceMode.TemplatedParent)
-        });
-        border.SetBinding(Border.PaddingProperty, new Binding("Padding")
-        {
-            RelativeSource = new RelativeSource(RelativeSourceMode.TemplatedParent)
-        });
-        var content = new FrameworkElementFactory(typeof(ContentPresenter));
-        content.SetBinding(ContentPresenter.ContentProperty, new Binding("Content")
-        {
-            RelativeSource = new RelativeSource(RelativeSourceMode.TemplatedParent)
-        });
-        content.SetValue(TextElement.ForegroundProperty, Text);
-        border.AppendChild(content);
-        template.VisualTree = border;
-        style.Setters.Add(new Setter(Control.TemplateProperty, template));
+    void TargetSelectionChanged(object sender, RoutedEventArgs e)
+    {
+        UpdateTargetSummary();
+        UpdateCommandPreview();
+    }
 
-        var hover = new Trigger { Property = UIElement.IsMouseOverProperty, Value = true };
-        hover.Setters.Add(new Setter(Control.BackgroundProperty, B("#252C39")));
-        style.Triggers.Add(hover);
-        var selected = new Trigger { Property = Selector.IsSelectedProperty, Value = true };
-        selected.Setters.Add(new Setter(Control.BackgroundProperty, B("#263B66")));
-        style.Triggers.Add(selected);
-        return style;
+    static bool IsCodexWindow(string exe, string title)
+    {
+        exe = (exe ?? "").ToLowerInvariant();
+        title = (title ?? "").ToLowerInvariant();
+        return exe == "codex.exe" || exe == "chatgpt.exe" || exe == "openai.exe" ||
+               exe == "chatgpt-desktop.exe" || title.Contains("codex") || title.Contains("chatgpt");
+    }
+
+    List<WinItem> SelectedTargets()
+    {
+        var result = new List<WinItem>();
+        var seen = new HashSet<long>();
+        bool automatic = false;
+        int codexCount = 0;
+        foreach (var choice in _targetChoices)
+            if (choice.Item.IsAuto && choice.Check.IsChecked == true) automatic = true;
+
+        if (automatic)
+        {
+            foreach (var choice in _targetChoices)
+            {
+                var item = choice.Item;
+                if (item.IsAuto || !item.IsCodex || item.Hwnd == IntPtr.Zero) continue;
+                if (seen.Add(item.Hwnd.ToInt64())) result.Add(item);
+                codexCount++;
+            }
+        }
+        foreach (var choice in _targetChoices)
+        {
+            var item = choice.Item;
+            if (item.IsAuto || choice.Check.IsChecked != true || item.Hwnd == IntPtr.Zero) continue;
+            if (seen.Add(item.Hwnd.ToInt64())) result.Add(item);
+        }
+
+        if (automatic && codexCount == 0 && result.Count == 0)
+            result.Add(new WinItem { IsAuto = true, Display = "自动检测 Codex / ChatGPT", Title = "Codex 自动检测" });
+        return result;
+    }
+
+    void UpdateTargetSummary()
+    {
+        if (_targetSummary == null) return;
+        var targets = SelectedTargets();
+        if (targets.Count == 0) _targetSummary.Text = "尚未选择目标窗口。";
+        else if (targets.Count == 1 && targets[0].IsAuto) _targetSummary.Text = "未发现可见 Codex，启动时仍会自动检测。";
+        else _targetSummary.Text = "将同时挂载到 " + targets.Count + " 个窗口。";
     }
 
     void RefreshTargets()
     {
-        var items = new List<WinItem>
+        bool automatic = !_targetsInitialized;
+        var selected = new HashSet<long>();
+        foreach (var choice in _targetChoices)
         {
-            new WinItem { Display = "默认：自动检测 Codex / ChatGPT", Pid = 0 }
-        };
+            if (choice.Item.IsAuto) automatic = choice.Check.IsChecked == true;
+            else if (choice.Check.IsChecked == true) selected.Add(choice.Item.Hwnd.ToInt64());
+        }
+
+        var items = new List<WinItem>();
         uint self = (uint)Process.GetCurrentProcess().Id;
         Native.EnumWindows((h, l) =>
         {
@@ -1450,12 +1445,41 @@ internal sealed class MainWindow : Window
             if (title == "Program Manager") return true;
             string disp = title;
             if (disp.Length > 46) disp = disp.Substring(0, 45) + "\u2026";
-            items.Add(new WinItem { Display = disp + "  ·  " + exe + "  ·  PID " + pid, Pid = pid });
+            items.Add(new WinItem
+            {
+                Hwnd = h, Pid = pid, Title = title, Exe = exe,
+                Display = disp + "  ·  " + exe + "  ·  PID " + pid,
+                IsCodex = IsCodexWindow(exe, title)
+            });
             return true;
         }, IntPtr.Zero);
 
-        _target.ItemsSource = items;
-        _target.SelectedIndex = 0;
+        items.Sort((a, b) =>
+        {
+            if (a.IsCodex != b.IsCodex) return a.IsCodex ? -1 : 1;
+            return string.Compare(a.Display, b.Display, StringComparison.CurrentCultureIgnoreCase);
+        });
+
+        _targetHost.Children.Clear();
+        _targetChoices.Clear();
+        var autoItem = new WinItem
+        {
+            IsAuto = true, IsCodex = true, Title = "自动包含所有 Codex / ChatGPT 窗口",
+            Display = "自动包含所有 Codex / ChatGPT 窗口"
+        };
+        var autoCheck = TargetCheck(autoItem, automatic);
+        _targetChoices.Add(new TargetChoice { Item = autoItem, Check = autoCheck });
+        _targetHost.Children.Add(autoCheck);
+
+        foreach (var item in items)
+        {
+            var check = TargetCheck(item, selected.Contains(item.Hwnd.ToInt64()));
+            _targetChoices.Add(new TargetChoice { Item = item, Check = check });
+            _targetHost.Children.Add(check);
+        }
+        _targetsInitialized = true;
+        UpdateTargetSummary();
+        UpdateCommandPreview();
     }
 
     // advanced -----------------------------------------------------------------
@@ -1484,7 +1508,7 @@ internal sealed class MainWindow : Window
 
         _weWindow = Input("CodexWallpaperHost");
         _weWindow.TextChanged += (s, e) => UpdateCommandPreview();
-        sp.Children.Add(LabeledInput("宿主窗口名称", "-playInWindow 使用的名称", _weWindow, false));
+        sp.Children.Add(LabeledInput("宿主窗口名称前缀", "多窗口时会自动追加目标 HWND", _weWindow, false));
 
         _contentClass = Input("");
         _contentClass.TextChanged += (s, e) => UpdateCommandPreview();
@@ -1634,7 +1658,36 @@ internal sealed class MainWindow : Window
             return;
         }
 
-        var args = BuildArgs();
+        var targets = SelectedTargets();
+        if (targets.Count == 0)
+        {
+            AppendLog("[!] 请至少选择一个目标窗口。", RedC);
+            return;
+        }
+        if (targets.Count > 1 && _wallpaper.Text.Trim().Length == 0)
+        {
+            AppendLog("[!] 多窗口模式需要选择壁纸文件，不能让多个实例接管同一个现有 WE 窗口。", RedC);
+            return;
+        }
+
+        bool strict = targets.Count > 1;
+        int started = 0;
+        for (int i = 0; i < targets.Count; i++)
+        {
+            string weWindow = MakeWeWindowName(targets[i], i, targets.Count);
+            if (StartHelper(targets[i], weWindow, strict)) started++;
+        }
+        if (started == 0) return;
+
+        _running = true; _stopping = false;
+        SetRunningUi(true);
+        SaveSettings();
+        AppendLog("▶ 已启动 " + started + " 个目标  (" + _mode + ")", GreenC);
+    }
+
+    bool StartHelper(WinItem target, string weWindow, bool strict)
+    {
+        var args = BuildArgs(target, weWindow, strict);
         var psi = new ProcessStartInfo(HelperPath, JoinArgs(args))
         {
             UseShellExecute = false,
@@ -1645,61 +1698,114 @@ internal sealed class MainWindow : Window
             StandardErrorEncoding = Encoding.UTF8,
             WorkingDirectory = _appDir
         };
+        var session = new HelperSession { Target = target, WeWindow = weWindow };
 
         try
         {
-            _proc = new Process { StartInfo = psi, EnableRaisingEvents = true };
-            _proc.OutputDataReceived += (s, e) => { if (e.Data != null) Dispatch(() => AppendLog(e.Data, ColorFor(e.Data))); };
-            _proc.ErrorDataReceived  += (s, e) => { if (e.Data != null) Dispatch(() => AppendLog(e.Data, RedC)); };
-            _proc.Exited += (s, e) => Dispatch(OnProcExited);
-            _proc.Start();
-            _proc.BeginOutputReadLine();
-            _proc.BeginErrorReadLine();
+            session.Process = new Process { StartInfo = psi, EnableRaisingEvents = true };
+            session.Process.OutputDataReceived += (s, e) =>
+            {
+                if (e.Data != null) Dispatch(() => AppendLog(SessionTag(session) + " " + e.Data, ColorFor(e.Data)));
+            };
+            session.Process.ErrorDataReceived += (s, e) =>
+            {
+                if (e.Data != null) Dispatch(() => AppendLog(SessionTag(session) + " " + e.Data, RedC));
+            };
+            session.Process.Exited += (s, e) => Dispatch(() => OnHelperExited(session));
+            session.Process.Start();
+            _sessions.Add(session);
+            session.Process.BeginOutputReadLine();
+            session.Process.BeginErrorReadLine();
+            AppendLog(SessionTag(session) + " 启动 helper", GreenC);
+            return true;
         }
         catch (Exception ex)
         {
-            AppendLog("[!] \u542F\u52A8\u5931\u8D25\uFF1A" + ex.Message, RedC);
-            _proc = null;
-            return;
+            AppendLog(SessionTag(session) + " [!] 启动失败：" + ex.Message, RedC);
+            try { if (session.Process != null) session.Process.Dispose(); } catch { }
+            return false;
         }
-
-        _running = true; _stopping = false;
-        SetRunningUi(true);
-        SaveSettings();
-        AppendLog("\u25B6 \u5DF2\u542F\u52A8  (" + _mode + ")", GreenC);
     }
 
     void StopClicked()
     {
-        if (!_running || _stopping || _proc == null) return;
+        if (!_running || _stopping || _sessions.Count == 0) return;
         _stopping = true;
         _stopBtn.IsEnabled = false;
         SetStatus("\u505C\u6B62\u4E2D\u2026", YellowC);
         AppendLog("\u25A0 \u6B63\u5728\u505C\u6B62\u2026", YellowC);
 
-        var proc = _proc;
-        var t = new Thread(() => GracefulStop(proc, 5000)) { IsBackground = true };
+        var sessions = new List<HelperSession>(_sessions);
+        var t = new Thread(() => StopAllHelpers(sessions, 5000, true)) { IsBackground = true };
         t.Start();
     }
 
-    // Post WM_CLOSE to the helper's message-only window so it runs RestoreAll();
-    // if it doesn't exit in time, kill it and run --restore to clean up.
-    void GracefulStop(Process proc, int timeoutMs)
+    // Post WM_CLOSE to every helper first, then wait against one shared deadline.
+    // A forced process gets a targeted --restore so another window is never cleaned up by mistake.
+    void StopAllHelpers(List<HelperSession> sessions, int timeoutMs, bool writeLog)
     {
-        try
+        DateTime deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+        foreach (var session in sessions)
         {
-            IntPtr msg = FindHelperMsgWindow(proc.Id);
-            if (msg != IntPtr.Zero) Native.PostMessage(msg, 0x0010 /*WM_CLOSE*/, IntPtr.Zero, IntPtr.Zero);
-
-            if (!proc.WaitForExit(timeoutMs))
+            session.StopRequested = true;
+            try
             {
-                Dispatch(() => AppendLog("[!] 未正常退出 —— 强制结束并执行 --restore", YellowC));
-                try { proc.Kill(); } catch { }
-                try { proc.WaitForExit(2000); } catch { }
-                RunRestoreSilent();
+                IntPtr msg = FindHelperMsgWindow(session.Process.Id);
+                if (msg != IntPtr.Zero) Native.PostMessage(msg, 0x0010 /*WM_CLOSE*/, IntPtr.Zero, IntPtr.Zero);
+            }
+            catch { }
+        }
+
+        foreach (var session in sessions)
+        {
+            try
+            {
+                int remaining = Math.Max(0, (int)(deadline - DateTime.UtcNow).TotalMilliseconds);
+                if (!session.Process.HasExited && !session.Process.WaitForExit(remaining))
+                {
+                    if (writeLog) Dispatch(() => AppendLog(SessionTag(session) + " [!] 未正常退出，强制结束并定向恢复", YellowC));
+                    try { session.Process.Kill(); } catch { }
+                    try { session.Process.WaitForExit(2000); } catch { }
+                    RunRestoreSilent(session.Target, session.WeWindow, SessionTag(session));
+                }
+            }
+            catch (Exception ex)
+            {
+                if (writeLog) Dispatch(() => AppendLog(SessionTag(session) + " [!] 停止出错：" + ex.Message, RedC));
+            }
+            finally
+            {
+                session.StopWaitFinished = true;
             }
         }
-        catch (Exception ex) { Dispatch(() => AppendLog("[!] 停止出错：" + ex.Message, RedC)); }
+
+        // WaitForExit guarantees the Exited event has been raised, but its dispatcher
+        // callback may still be queued. Reconcile once so a closed helper cannot leave
+        // the UI stuck in the running state; OnHelperExited is deliberately idempotent.
+        Dispatch(() =>
+        {
+            foreach (var session in sessions)
+            {
+                bool exited = false;
+                try { exited = session.Process == null || session.Process.HasExited; } catch { }
+                if (exited) OnHelperExited(session);
+            }
+
+            // Do not unlock from an individual Exited callback: a forced-stop restore
+            // may still be running for another target. Only this coordinator knows that
+            // every wait/kill/targeted restore in the batch has completed.
+            if (_sessions.Count == 0)
+            {
+                _running = false; _stopping = false;
+                SetRunningUi(false);
+            }
+            else
+            {
+                _running = true; _stopping = false;
+                _stopBtn.IsEnabled = true;
+                SetStatus("仍有 " + _sessions.Count + " 个目标未停止", RedC);
+            }
+        });
     }
 
     // Live opacity: post straight to the running helper's message-only window so the
@@ -1710,13 +1816,16 @@ internal sealed class MainWindow : Window
 
     void SendLiveAlpha(uint msg, int value)
     {
-        if (!_running || _proc == null) return;
-        try
+        if (!_running) return;
+        foreach (var session in new List<HelperSession>(_sessions))
         {
-            IntPtr h = FindHelperMsgWindow(_proc.Id);
-            if (h != IntPtr.Zero) Native.PostMessage(h, msg, new IntPtr(value), IntPtr.Zero);
+            try
+            {
+                IntPtr h = FindHelperMsgWindow(session.Process.Id);
+                if (h != IntPtr.Zero) Native.PostMessage(h, msg, new IntPtr(value), IntPtr.Zero);
+            }
+            catch { }
         }
-        catch { }
     }
 
     // The C++ helper registers "WeCodexBgMsg", the C# one "WeCodexBgMsgCs".  build.bat
@@ -1743,30 +1852,69 @@ internal sealed class MainWindow : Window
         return IntPtr.Zero;
     }
 
-    void OnProcExited()
+    void OnHelperExited(HelperSession session)
     {
+        if (!_sessions.Contains(session))
+        {
+            if (session.StopWaitFinished)
+                try { if (session.Process != null) session.Process.Dispose(); } catch { }
+            return;
+        }
+
         int code = 0;
-        try { code = _proc != null ? _proc.ExitCode : 0; } catch { }
-        _running = false; _stopping = false;
-        SetRunningUi(false);
-        AppendLog("\u25CF \u5DF2\u505C\u6B62  (\u9000\u51FA\u7801 " + code + ")", code == 0 ? Muted : RedC);
-        try { if (_proc != null) _proc.Dispose(); } catch { }
-        _proc = null;
+        try { code = session.Process != null ? session.Process.ExitCode : 0; } catch { }
+        _sessions.Remove(session);
+        AppendLog(SessionTag(session) + " ● 已停止  (退出码 " + code + ")", code == 0 ? Muted : RedC);
+        if (!session.StopRequested || session.StopWaitFinished)
+            try { if (session.Process != null) session.Process.Dispose(); } catch { }
+
+        if (_sessions.Count == 0)
+        {
+            if (!_stopping)
+            {
+                _running = false;
+                SetRunningUi(false);
+            }
+        }
+        else if (!_stopping)
+        {
+            SetStatus("运行中  ·  " + _sessions.Count + " 个目标", GreenC);
+        }
     }
 
     void RunRestore()
     {
         if (!File.Exists(HelperPath)) { AppendLog("[!] \u627E\u4E0D\u5230\u8F85\u52A9\u7A0B\u5E8F exe\u3002", RedC); return; }
-        AppendLog("\u21BA \u6B63\u5728\u6267\u884C --restore\u2026", YellowC);
-        var t = new Thread(RunRestoreSilent) { IsBackground = true };
+        var targets = SelectedTargets();
+        if (targets.Count == 0) { AppendLog("[!] 请先选择要恢复的目标窗口。", RedC); return; }
+        AppendLog("↺ 正在定向恢复 " + targets.Count + " 个目标…", YellowC);
+        var t = new Thread(() =>
+        {
+            for (int i = 0; i < targets.Count; i++)
+            {
+                string weWindow = MakeWeWindowName(targets[i], i, targets.Count);
+                RunRestoreSilent(targets[i], weWindow, "[恢复 " + TargetName(targets[i]) + "]");
+            }
+        }) { IsBackground = true };
         t.Start();
     }
 
-    void RunRestoreSilent()
+    void RunRestoreSilent(WinItem target, string weWindow, string tag)
     {
         try
         {
-            var psi = new ProcessStartInfo(HelperPath, "--restore")
+            var args = new List<string> { "--restore" };
+            if (target != null && target.Hwnd != IntPtr.Zero)
+            {
+                args.Add("--hwnd"); args.Add("0x" + target.Hwnd.ToInt64().ToString("X"));
+                args.Add("--pid"); args.Add(target.Pid.ToString());
+            }
+            if (!string.IsNullOrWhiteSpace(weWindow))
+            {
+                args.Add("--we-window"); args.Add(weWindow);
+                args.Add("--strict-we-window");
+            }
+            var psi = new ProcessStartInfo(HelperPath, JoinArgs(args))
             {
                 UseShellExecute = false, CreateNoWindow = true,
                 RedirectStandardOutput = true, RedirectStandardError = true,
@@ -1778,15 +1926,15 @@ internal sealed class MainWindow : Window
             foreach (var line in outp.Split('\n'))
             {
                 var ln = line.TrimEnd('\r');
-                if (ln.Length > 0) Dispatch(() => AppendLog(ln, ColorFor(ln)));
+                if (ln.Length > 0) Dispatch(() => AppendLog(tag + " " + ln, ColorFor(ln)));
             }
         }
-        catch (Exception ex) { Dispatch(() => AppendLog("[!] 恢复失败：" + ex.Message, RedC)); }
+        catch (Exception ex) { Dispatch(() => AppendLog(tag + " [!] 恢复失败：" + ex.Message, RedC)); }
     }
 
     // ------------------------------------------------------------- args build --
 
-    List<string> BuildArgs()
+    List<string> BuildArgs(WinItem target, string weWindow, bool strictWeWindow)
     {
         var a = new List<string>();
         string wp = _wallpaper.Text.Trim();
@@ -1800,8 +1948,9 @@ internal sealed class MainWindow : Window
         string we = _we.Text.Trim();
         if (we.Length > 0) { a.Add("--we"); a.Add(we); }
 
-        string ww = _weWindow.Text.Trim();
-        if (ww.Length > 0 && ww != "CodexWallpaperHost") { a.Add("--we-window"); a.Add(ww); }
+        if (!string.IsNullOrWhiteSpace(weWindow) && weWindow != "CodexWallpaperHost")
+        { a.Add("--we-window"); a.Add(weWindow); }
+        if (strictWeWindow) a.Add("--strict-we-window");
 
         string cc = _contentClass.Text.Trim();
         if (cc.Length > 0) { a.Add("--content-class"); a.Add(cc); }
@@ -1815,8 +1964,11 @@ internal sealed class MainWindow : Window
         if (_keepWe.IsChecked == true) a.Add("--keep-we");
         if (_noFallback.IsChecked == true) a.Add("--no-fallback");
 
-        var sel = _target != null ? _target.SelectedItem as WinItem : null;
-        if (sel != null && sel.Pid != 0) { a.Add("--pid"); a.Add(sel.Pid.ToString()); }
+        if (target != null && target.Hwnd != IntPtr.Zero)
+        {
+            a.Add("--hwnd"); a.Add("0x" + target.Hwnd.ToInt64().ToString("X"));
+            a.Add("--pid"); a.Add(target.Pid.ToString());
+        }
 
         a.Add("-v");
         return a;
@@ -1825,7 +1977,42 @@ internal sealed class MainWindow : Window
     void UpdateCommandPreview()
     {
         if (_cmdPreview == null) return;
-        _cmdPreview.Text = "we-codex-bg.exe " + JoinArgs(BuildArgs());
+        var targets = SelectedTargets();
+        if (targets.Count == 0) { _cmdPreview.Text = "未选择目标窗口"; return; }
+        var sb = new StringBuilder();
+        if (targets.Count > 1) sb.Append("将启动 ").Append(targets.Count).Append(" 个 helper：\n");
+        int shown = Math.Min(targets.Count, 3);
+        for (int i = 0; i < shown; i++)
+        {
+            if (i > 0) sb.Append('\n');
+            string weWindow = MakeWeWindowName(targets[i], i, targets.Count);
+            sb.Append("we-codex-bg.exe ").Append(JoinArgs(BuildArgs(targets[i], weWindow, targets.Count > 1)));
+        }
+        if (targets.Count > shown) sb.Append("\n…其余 ").Append(targets.Count - shown).Append(" 个目标使用相同参数");
+        _cmdPreview.Text = sb.ToString();
+    }
+
+    string MakeWeWindowName(WinItem target, int index, int total)
+    {
+        string baseName = _weWindow != null ? _weWindow.Text.Trim() : "";
+        if (baseName.Length == 0) baseName = "CodexWallpaperHost";
+        if (total <= 1) return baseName;
+        string suffix = target != null && target.Hwnd != IntPtr.Zero
+            ? target.Hwnd.ToInt64().ToString("X") : (index + 1).ToString();
+        return baseName + "-" + suffix;
+    }
+
+    static string TargetName(WinItem target)
+    {
+        if (target == null || target.IsAuto) return "Codex 自动检测";
+        string title = target.Title ?? target.Exe ?? "窗口";
+        if (title.Length > 22) title = title.Substring(0, 21) + "…";
+        return title + " · " + target.Pid;
+    }
+
+    static string SessionTag(HelperSession session)
+    {
+        return "[" + TargetName(session != null ? session.Target : null) + "]";
     }
 
     static string JoinArgs(List<string> a)
@@ -1853,11 +2040,12 @@ internal sealed class MainWindow : Window
         // live on purpose: they are pushed to the running helper and are exactly what
         // you need to tune while watching the result.
         foreach (var c in new Control[] { _wallpaper, _we, _weWindow, _contentClass, _round, _fps,
-                                          _target, _full, _keepWe, _noFallback })
+                                          _full, _keepWe, _noFallback })
             if (c != null) c.IsEnabled = !running;
+        if (_targetControls != null) _targetControls.IsEnabled = !running;
         foreach (var card in _modeCards) card.IsHitTestVisible = !running;
 
-        if (running) SetStatus("运行中  ·  " + _mode, GreenC);
+        if (running) SetStatus("运行中  ·  " + _sessions.Count + " 个目标  ·  " + _mode, GreenC);
         else SetStatus("空闲", Muted);
     }
 
@@ -1968,21 +2156,10 @@ internal sealed class MainWindow : Window
 
         if (_tray != null) { _tray.Visible = false; _tray.Dispose(); _tray = null; }
         SaveSettings();
-        if (_running && _proc != null)
+        if (_running && _sessions.Count > 0)
         {
-            // stop synchronously so we never leave the Codex window modified
-            try
-            {
-                var proc = _proc;
-                IntPtr msg = FindHelperMsgWindow(proc.Id);
-                if (msg != IntPtr.Zero) Native.PostMessage(msg, 0x0010, IntPtr.Zero, IntPtr.Zero);
-                if (!proc.WaitForExit(4000))
-                {
-                    try { proc.Kill(); } catch { }
-                    RunRestoreSilent();
-                }
-            }
-            catch { }
+            _stopping = true;
+            StopAllHelpers(new List<HelperSession>(_sessions), 4000, false);
         }
     }
 
